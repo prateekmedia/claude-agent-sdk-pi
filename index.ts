@@ -1,6 +1,7 @@
-import { createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
+import { createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createSdkMcpServer, query, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
@@ -52,26 +53,128 @@ const MODELS = getModels("anthropic").map((model) => ({
 	maxTokens: model.maxTokens,
 }));
 
-function buildPrompt(context: Context, customToolNameToSdk?: Map<string, string>): string {
-	const parts: string[] = [];
+const DEFAULT_CACHE_CONTROL: CacheControlEphemeral = { type: "ephemeral", ttl: "1h" };
+
+function buildPromptBlocks(context: Context, customToolNameToSdk?: Map<string, string>): ContentBlockParam[] {
+	const blocks: ContentBlockParam[] = [];
+	const messageEndIndexes: number[] = [];
+
+	const pushText = (text: string) => {
+		blocks.push({ type: "text", text });
+	};
+
+	const pushImage = (image: ImageContent) => {
+		blocks.push({
+			type: "image",
+			source: {
+				type: "base64",
+				media_type: image.mimeType as Base64ImageSource["media_type"],
+				data: image.data,
+			},
+		});
+	};
+
+	const pushPrefix = (label: string) => {
+		const prefix = `${blocks.length ? "\n\n" : ""}${label}\n`;
+		pushText(prefix);
+	};
+
+	const appendContentBlocks = (
+		content:
+			| string
+			| Array<{
+					type: string;
+					text?: string;
+					data?: string;
+					mimeType?: string;
+				}>,
+	): boolean => {
+		if (typeof content === "string") {
+			if (content.length > 0) {
+				pushText(content);
+				return content.trim().length > 0;
+			}
+			return false;
+		}
+		if (!Array.isArray(content)) return false;
+		let hasText = false;
+		for (const block of content) {
+			if (block.type === "text") {
+				const text = block.text ?? "";
+				if (text.trim().length > 0) hasText = true;
+				pushText(text);
+				continue;
+			}
+			if (block.type === "image") {
+				pushImage(block as ImageContent);
+				continue;
+			}
+			pushText(`[${block.type}]`);
+		}
+		return hasText;
+	};
+
 	for (const message of context.messages) {
 		if (message.role === "user") {
-			parts.push(`USER:\n${contentToText(message.content, customToolNameToSdk)}`);
+			pushPrefix("USER:");
+			const hasText = appendContentBlocks(message.content);
+			if (!hasText) {
+				pushText("(see attached image)");
+			}
+			messageEndIndexes.push(blocks.length - 1);
 			continue;
 		}
 
 		if (message.role === "assistant") {
-			parts.push(`ASSISTANT:\n${contentToText(message.content, customToolNameToSdk)}`);
+			pushPrefix("ASSISTANT:");
+			const text = contentToText(message.content, customToolNameToSdk);
+			if (text.length > 0) {
+				pushText(text);
+			}
+			messageEndIndexes.push(blocks.length - 1);
 			continue;
 		}
 
 		if (message.role === "toolResult") {
 			const header = `TOOL RESULT (${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}):`;
-			parts.push(`${header}\n${contentToText(message.content, customToolNameToSdk)}`);
+			pushPrefix(header);
+			const hasText = appendContentBlocks(message.content);
+			if (!hasText) {
+				pushText("(see attached image)");
+			}
+			messageEndIndexes.push(blocks.length - 1);
 		}
 	}
 
-	return parts.join("\n\n");
+	if (!blocks.length) return [{ type: "text", text: "" }];
+
+	const cacheTargets = messageEndIndexes.slice(-2);
+	for (const index of cacheTargets) {
+		const block = blocks[index];
+		if (block && (block.type === "text" || block.type === "image")) {
+			(block as TextBlockParam | ImageBlockParam).cache_control = DEFAULT_CACHE_CONTROL;
+		}
+	}
+
+	return blocks;
+}
+
+function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
+	async function* generator() {
+		const message: SDKUserMessage = {
+			type: "user",
+			message: {
+				role: "user",
+				content: promptBlocks,
+			} as MessageParam,
+			parent_tool_use_id: null,
+			session_id: "prompt",
+		};
+
+		yield message;
+	}
+
+	return generator();
 }
 
 function contentToText(
@@ -470,7 +573,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let sdkQuery: ReturnType<typeof query> | undefined;
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
-			const prompt = buildPrompt(context, customToolNameToSdk);
+			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
+			const prompt = buildPromptStream(promptBlocks);
 			const { apiKey: resolvedApiKey, isOAuth } = await resolveSdkApiKey(options);
 			const env = { ...process.env } as Record<string, string | undefined>;
 			delete env.ANTHROPIC_API_KEY;
