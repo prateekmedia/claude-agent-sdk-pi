@@ -576,9 +576,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			delete env.ANTHROPIC_OAUTH_TOKEN;
 			delete env.CLAUDE_API_KEY;
 
+			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 			if (resolvedApiKey && !isOAuth) {
 				env.ANTHROPIC_API_KEY = resolvedApiKey;
 				env.CLAUDE_API_KEY = resolvedApiKey;
+			}
+			// Keep the environment in sync with the requested working directory so the
+			// underlying SDK (and spawned helpers) receive the same cwd even when
+			// appendSystemPrompt is disabled.
+			if (cwd) {
+				env.PWD = cwd;
+				if (!env.CWD) env.CWD = cwd;
 			}
 
 			const mcpServers = buildCustomToolServers(customTools);
@@ -590,7 +598,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
-			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 			const settingSources: SettingSource[] | undefined = appendSystemPrompt ? undefined : ["user", "project"];
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 				cwd,
