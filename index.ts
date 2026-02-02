@@ -536,6 +536,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		};
 
 		const abortController = new AbortController();
+		let sdkQuery: ReturnType<typeof query> | undefined;
 		let wasAborted = false;
 		const onAbort = () => {
 			wasAborted = true;
@@ -565,7 +566,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let sawToolCall = false;
 		let shouldStopEarly = false;
 
-		let sdkQuery: ReturnType<typeof query> | undefined;
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
 			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
