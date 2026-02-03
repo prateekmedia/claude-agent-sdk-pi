@@ -242,7 +242,7 @@ function readSettingsFile(filePath: string): ProviderSettings {
 			typeof settingsBlock["appendSystemPrompt"] === "boolean"
 				? settingsBlock["appendSystemPrompt"]
 				: undefined;
-		const legacyDisable = settingsBlock["disableSkillsAppend"] === true || settingsBlock["disableAgentsAppend"] === true;
+		const legacyDisable = false;
 		return {
 			appendSystemPrompt: appendSystemPrompt ?? (legacyDisable ? false : undefined),
 		};
@@ -471,39 +471,6 @@ function mapThinkingTokens(reasoning?: SimpleStreamOptions["reasoning"]): number
 	return budgets[reasoning];
 }
 
-function looksLikeEnvName(value: string): boolean {
-	return /^[A-Z0-9_]+$/.test(value);
-}
-
-function looksLikeOAuthKey(value: string): boolean {
-	return value.startsWith("sk-ant-oat");
-}
-
-let cachedAuthStorage: AuthStorage | undefined;
-
-type ApiKeyResolution = {
-	apiKey?: string;
-	isOAuth: boolean;
-};
-
-async function resolveSdkApiKey(options?: SimpleStreamOptions): Promise<ApiKeyResolution> {
-	const candidate = options?.apiKey;
-	if (candidate && !looksLikeEnvName(candidate)) {
-		return { apiKey: candidate, isOAuth: looksLikeOAuthKey(candidate) };
-	}
-	if (candidate && process.env[candidate]) {
-		const value = process.env[candidate];
-		return { apiKey: value, isOAuth: value ? looksLikeOAuthKey(value) : false };
-	}
-	if (!cachedAuthStorage) {
-		cachedAuthStorage = new AuthStorage();
-	}
-	cachedAuthStorage.reload();
-	const credential = cachedAuthStorage.get("anthropic");
-	const apiKey = await cachedAuthStorage.getApiKey("anthropic");
-	return { apiKey, isOAuth: credential?.type === "oauth" || (apiKey ? looksLikeOAuthKey(apiKey) : false) };
-}
-
 function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
 	if (!input) return fallback;
 	try {
@@ -570,24 +537,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
 			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
 			const prompt = buildPromptStream(promptBlocks);
-			const { apiKey: resolvedApiKey, isOAuth } = await resolveSdkApiKey(options);
-			const env = { ...process.env } as Record<string, string | undefined>;
-			delete env.ANTHROPIC_API_KEY;
-			delete env.ANTHROPIC_OAUTH_TOKEN;
-			delete env.CLAUDE_API_KEY;
 
 			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-			if (resolvedApiKey && !isOAuth) {
-				env.ANTHROPIC_API_KEY = resolvedApiKey;
-				env.CLAUDE_API_KEY = resolvedApiKey;
-			}
-			// Keep the environment in sync with the requested working directory so the
-			// underlying SDK (and spawned helpers) receive the same cwd even when
-			// appendSystemPrompt is disabled.
-			if (cwd) {
-				env.PWD = cwd;
-				if (!env.CWD) env.CWD = cwd;
-			}
 
 			const mcpServers = buildCustomToolServers(customTools);
 			const providerSettings = loadProviderSettings();
@@ -609,10 +560,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					behavior: "deny",
 					message: TOOL_EXECUTION_DENIED_MESSAGE,
 				}),
-				env,
-				...(systemPromptAppend
-					? { systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend } }
-					: {}),
+				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
 				...(settingSources ? { settingSources } : {}),
 				...(mcpServers ? { mcpServers } : {}),
 			};
