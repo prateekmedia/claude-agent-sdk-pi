@@ -12,16 +12,21 @@ This extension registers a custom provider that routes LLM calls through the **C
 
 ## Setup
 
-1) Install the extension globally:
+1) Install the extension globally (npm is the preferred source now):
+
+```
+pi install npm:claude-agent-sdk-pi@latest
+```
+
+(You can omit `@latest` to use the latest version, or pin a specific version for reproducible installs.)
+
+**Alternative (git):**
 
 ```
 pi install git:github.com/prateekmedia/claude-agent-sdk-pi
 ```
 
-Installed path (for git installs, pi places it under):
-```
-~/.pi/agent/git/github.com/prateekmedia/claude-agent-sdk-pi/
-```
+See **pi-coding-agent** install docs for other install sources and paths.
 
 2) **Authenticate** (choose one):
 
