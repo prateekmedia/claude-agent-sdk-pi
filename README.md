@@ -10,6 +10,10 @@ This extension registers a custom provider that routes LLM calls through the **C
 - Custom tools are exposed to Claude Code via in-process MCP.
 - Skills can be appended to Claude Code’s default system prompt (optional).
 
+## Demo
+
+![Demo](screenshot.png)
+
 ## Setup
 
 1) Install the extension globally (npm is the preferred source now):
