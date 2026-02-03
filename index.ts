@@ -1,4 +1,4 @@
-import { createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
+import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
@@ -502,13 +502,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			timestamp: Date.now(),
 		};
 
-		const abortController = new AbortController();
 		let sdkQuery: ReturnType<typeof query> | undefined;
 		let wasAborted = false;
+		const requestAbort = () => {
+			if (!sdkQuery) return;
+			void sdkQuery.interrupt().catch(() => {
+				try {
+					sdkQuery?.close();
+				} catch {
+					// ignore shutdown errors
+				}
+			});
+		};
 		const onAbort = () => {
 			wasAborted = true;
-			abortController.abort();
-			sdkQuery?.close();
+			requestAbort();
 		};
 		if (options?.signal) {
 			if (options.signal.aborted) onAbort();
@@ -552,7 +560,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const settingSources: SettingSource[] | undefined = appendSystemPrompt ? undefined : ["user", "project"];
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 				cwd,
-				abortController,
 				tools: sdkTools,
 				permissionMode: "dontAsk",
 				includePartialMessages: true,
@@ -575,6 +582,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				options: queryOptions,
 			});
 
+			if (wasAborted) {
+				requestAbort();
+			}
+
 			for await (const message of sdkQuery) {
 				if (!started) {
 					stream.push({ type: "start", partial: output });
@@ -594,6 +605,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							output.usage.cacheWrite = usage?.cache_creation_input_tokens ?? 0;
 							output.usage.totalTokens =
 								output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+							calculateCost(model, output.usage);
 							break;
 						}
 
@@ -716,6 +728,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
 							output.usage.totalTokens =
 								output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+							calculateCost(model, output.usage);
 							break;
 						}
 
@@ -741,7 +754,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				}
 			}
 
-			if (wasAborted || abortController.signal.aborted || options?.signal?.aborted) {
+			if (wasAborted || options?.signal?.aborted) {
 				output.stopReason = "aborted";
 				output.errorMessage = "Operation aborted";
 				stream.push({ type: "error", reason: "aborted", error: output });
