@@ -1,6 +1,6 @@
 {
   "name": "claude-agent-sdk-pi",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "type": "module",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.27",
