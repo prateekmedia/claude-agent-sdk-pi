@@ -208,6 +208,23 @@ function mapPiToolNameToSdk(name?: string, customToolNameToSdk?: Map<string, str
 
 type ProviderSettings = {
 	appendSystemPrompt?: boolean;
+
+	/**
+	 * Controls which filesystem-based configuration sources the SDK loads settings from
+	 * (maps to Claude Code CLI --setting-sources)
+	 *
+	 * - "user"    => ~/.claude (or CLAUDE_CONFIG_DIR)
+	 * - "project" => .claude in the current repo
+	 * - "local"   => .claude/settings.local.json in the current repo
+	 */
+	settingSources?: SettingSource[];
+
+	/**
+	 * When true, pass Claude Code CLI --strict-mcp-config to ignore MCP servers from ~/.claude.json
+	 * and project .mcp.json files. This prevents Claude Code from auto-injecting large MCP tool
+	 * schemas (a major token cost) when appendSystemPrompt=false.
+	 */
+	strictMcpConfig?: boolean;
 };
 
 function extractSkillsAppend(systemPrompt?: string): string | undefined {
@@ -242,9 +259,25 @@ function readSettingsFile(filePath: string): ProviderSettings {
 			typeof settingsBlock["appendSystemPrompt"] === "boolean"
 				? settingsBlock["appendSystemPrompt"]
 				: undefined;
+
+		const settingSourcesRaw = settingsBlock["settingSources"];
+		const settingSources =
+			Array.isArray(settingSourcesRaw) &&
+			settingSourcesRaw.every(
+				(value) =>
+					typeof value === "string" && (value === "user" || value === "project" || value === "local"),
+			)
+				? (settingSourcesRaw as SettingSource[])
+				: undefined;
+
+		const strictMcpConfig =
+			typeof settingsBlock["strictMcpConfig"] === "boolean" ? settingsBlock["strictMcpConfig"] : undefined;
+
 		const legacyDisable = false;
 		return {
 			appendSystemPrompt: appendSystemPrompt ?? (legacyDisable ? false : undefined),
+			settingSources,
+			strictMcpConfig,
 		};
 	} catch {
 		return {};
@@ -557,7 +590,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
-			const settingSources: SettingSource[] | undefined = appendSystemPrompt ? undefined : ["user", "project"];
+			const settingSources: SettingSource[] | undefined = appendSystemPrompt
+				? undefined
+				: providerSettings.settingSources ?? ["user", "project"];
+
+			// Claude Code will auto-load MCP servers from ~/.claude.json and .mcp.json when settingSources is enabled.
+			// In this provider, Claude Code tool execution is denied and pi executes tools instead, so auto-loaded MCP
+			// tools are pure token overhead. Pass --strict-mcp-config to ignore all MCP configs except those explicitly
+			// provided via the SDK (mcpServers option).
+			const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
+			const extraArgs = strictMcpConfigEnabled ? { "strict-mcp-config": null } : undefined;
+
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 				cwd,
 				tools: sdkTools,
@@ -569,6 +612,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				}),
 				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
 				...(settingSources ? { settingSources } : {}),
+				...(extraArgs ? { extraArgs } : {}),
 				...(mcpServers ? { mcpServers } : {}),
 			};
 

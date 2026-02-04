@@ -93,19 +93,23 @@ The provider automatically maps these back to the pi tool name (e.g. `subagent`)
    - No extra config needed.
 
 2) **Use Claude Code’s dir (Recommended)**
-   - Set `appendSystemPrompt: false` so Claude Code loads its own resources.
-   - It will look for `~/.claude/skills/` and `~/.claude/CLAUDE.md` (and project `.claude/`).
-   - You can symlink your **pi skills** and **AGENTS.md** there.
+   - Set `appendSystemPrompt: false` so Claude Code loads its own resources from `.claude/`.
+   - By default it loads both user + project settings (`["user","project"]`).
+   - If you want to **ignore project-level `.claude/` folders**, set `settingSources: ["user"]`.
+   - This provider runs Claude Code in a **tool-denied** mode (pi executes tools), so auto-loading MCP servers from
+     `~/.claude.json` is usually just token overhead. By default, the provider passes `--strict-mcp-config` to prevent
+     that tool schema dump. Set `strictMcpConfig: false` to opt out.
 
-   **Config:**
+   **Config (user-only CLAUDE.md/skills + no MCP auto-load):**
    ```json
    {
      "claudeAgentSdkProvider": {
-       "appendSystemPrompt": false
+       "appendSystemPrompt": false,
+       "settingSources": ["user"],
+       "strictMcpConfig": true
      }
    }
    ```
-
 
    ```bash
    ln -s ~/.pi/agent/AGENTS.md ~/.claude/CLAUDE.md
