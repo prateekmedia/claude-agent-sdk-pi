@@ -1,7 +1,7 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
+import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
@@ -42,33 +42,6 @@ const PROJECT_SKILLS_ROOT = join(process.cwd(), ".pi", "skills");
 const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
-
-const SDK_SESSION_CUSTOM_TYPE = "claude-agent-sdk";
-
-type SdkSessionEntryData = {
-	providerId?: string;
-	sdkSessionId?: string;
-	sdkAssistantUuid?: string;
-	assistantTimestamp?: number;
-	pendingToolUseTimestamp?: number | null;
-	pendingToolUseIds?: string[] | null;
-};
-
-type SdkSessionState = {
-	sdkSessionId?: string;
-	uuidByAssistantTimestamp: Map<number, string>;
-	maxTimestamp?: number;
-	pendingToolUseTimestamp?: number;
-	pendingToolUseIds?: string[];
-};
-
-type SessionSdkState = {
-	branch: SdkSessionState;
-	all: SdkSessionState;
-};
-
-const sdkStateBySessionKey = new Map<string, SessionSdkState>();
-let extensionApi: ExtensionAPI | undefined;
 
 const MODELS = getModels("anthropic").map((model) => ({
 	id: model.id,
@@ -179,7 +152,7 @@ function buildPromptBlocks(
 function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
 	async function* generator() {
 		const message: SDKUserMessage = {
-			type: "user" as const,
+			type: "user",
 			message: {
 				role: "user",
 				content: promptBlocks,
@@ -220,283 +193,6 @@ function contentToText(
 			return `[${block.type}]`;
 		})
 		.join("\n");
-}
-
-function convertPiContentToBlocks(
-	content:
-		| string
-		| Array<{
-			type: string;
-			text?: string;
-			data?: string;
-			mimeType?: string;
-		}>,
-	supportsImages: boolean,
-): string | ContentBlockParam[] {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	const blocks: ContentBlockParam[] = [];
-	let hasText = false;
-	let hasImage = false;
-	for (const block of content) {
-		if (block.type === "text") {
-			const text = block.text ?? "";
-			if (text.trim().length > 0) hasText = true;
-			blocks.push({ type: "text", text });
-			continue;
-		}
-		if (block.type === "image") {
-			if (!supportsImages) continue;
-			hasImage = true;
-			blocks.push({
-				type: "image",
-				source: {
-					type: "base64",
-					media_type: block.mimeType as Base64ImageSource["media_type"],
-					data: block.data ?? "",
-				},
-			} satisfies ImageBlockParam);
-			continue;
-		}
-		blocks.push({ type: "text", text: `[${block.type}]` } as TextBlockParam);
-	}
-	if (!blocks.length) {
-		return supportsImages ? "(see attached image)" : "(image omitted)";
-	}
-	if (!hasText && hasImage) {
-		blocks.unshift({ type: "text", text: "(see attached image)" } as TextBlockParam);
-	}
-	return blocks;
-}
-
-function contentToPlainText(
-	content:
-		| string
-		| Array<{
-			type: string;
-			text?: string;
-			data?: string;
-			mimeType?: string;
-		}>,
-): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	let text = "";
-	let hasText = false;
-	let hasImage = false;
-	for (const block of content) {
-		if (block.type === "text") {
-			const value = block.text ?? "";
-			if (value.trim().length > 0) hasText = true;
-			text += `${text ? "\n" : ""}${value}`;
-			continue;
-		}
-		if (block.type === "image") {
-			hasImage = true;
-			continue;
-		}
-		text += `${text ? "\n" : ""}[${block.type}]`;
-	}
-	if (!hasText && hasImage) {
-		return "(see attached image)";
-	}
-	return text;
-}
-
-function buildHistoricalSummary(messages: Context["messages"], customToolNameToSdk?: Map<string, string>): string {
-	const lines: string[] = [];
-	for (const message of messages) {
-		if (message.role === "user") {
-			const text = contentToPlainText(message.content);
-			if (text.trim().length > 0) lines.push(`USER: ${text}`);
-			else lines.push("USER: (see attached image)");
-			continue;
-		}
-		if (message.role === "assistant") {
-			const text = contentToText(message.content, customToolNameToSdk);
-			if (text.trim().length > 0) lines.push(`ASSISTANT: ${text}`);
-			continue;
-		}
-		if (message.role === "toolResult") {
-			const toolName = mapPiToolNameToSdk(message.toolName, customToolNameToSdk);
-			const text = contentToPlainText(message.content);
-			if (text.trim().length > 0) {
-				lines.push(`TOOL RESULT (historical ${toolName}): ${text}`);
-			} else {
-				lines.push(`TOOL RESULT (historical ${toolName}): (see attached image)`);
-			}
-		}
-	}
-	if (!lines.length) return "";
-	return `Historical context (non-executable):\n${lines.join("\n")}`;
-}
-
-function buildPromptWithSummary(
-	summaryText: string,
-	userMessage: Extract<Context["messages"][number], { role: "user" }> | undefined,
-	supportsImages: boolean,
-): AsyncIterable<SDKUserMessage> | string {
-	if (!summaryText && !userMessage) return "";
-
-	async function* generator() {
-		if (summaryText.trim().length > 0) {
-			yield {
-				type: "user" as const,
-				message: { role: "user", content: summaryText } as MessageParam,
-				parent_tool_use_id: null,
-				session_id: "prompt",
-			};
-		}
-		if (userMessage) {
-			const content = convertPiContentToBlocks(userMessage.content, supportsImages);
-			if (typeof content === "string") {
-				if (content.trim().length > 0) {
-					yield {
-						type: "user" as const,
-						message: { role: "user", content } as MessageParam,
-						parent_tool_use_id: null,
-						session_id: "prompt",
-					};
-				}
-			} else if (content.length > 0) {
-				yield {
-					type: "user" as const,
-					message: { role: "user", content } as MessageParam,
-					parent_tool_use_id: null,
-					session_id: "prompt",
-				};
-			}
-		}
-	}
-
-	return generator();
-}
-
-function normalizeToolResultContent(
-	content: string | ContentBlockParam[],
-	isError: boolean,
-): string | ContentBlockParam[] {
-	const fallback = isError ? "(tool error with no output)" : "(no output)";
-	if (typeof content === "string") {
-		return content.trim().length > 0 ? content : fallback;
-	}
-	if (!Array.isArray(content) || content.length === 0) {
-		return fallback;
-	}
-	const hasImage = content.some((block) => block.type === "image");
-	const hasText = content.some((block) => block.type === "text" && "text" in block && block.text?.trim());
-	if (!hasImage && !hasText) {
-		return [{ type: "text", text: fallback }];
-	}
-	return content;
-}
-
-function buildResumePromptFromTail(
-	tailMessages: Context["messages"],
-	supportsImages: boolean,
-	allowedToolUseIds?: Set<string>,
-): AsyncIterable<SDKUserMessage> | string {
-	if (!tailMessages.length) return "";
-
-	async function* generator() {
-		let index = 0;
-		while (index < tailMessages.length) {
-			const message = tailMessages[index];
-			if (message.role === "user") {
-				const content = convertPiContentToBlocks(message.content, supportsImages);
-				if (typeof content === "string") {
-					if (content.trim().length > 0) {
-						yield {
-							type: "user" as const,
-							message: { role: "user", content } as MessageParam,
-							parent_tool_use_id: null,
-							session_id: "prompt",
-						};
-					}
-				} else if (content.length > 0) {
-					yield {
-						type: "user" as const,
-						message: { role: "user", content } as MessageParam,
-						parent_tool_use_id: null,
-						session_id: "prompt",
-					};
-				}
-				index += 1;
-				continue;
-			}
-
-			if (message.role === "toolResult") {
-				const toolResults: ContentBlockParam[] = [];
-				const skippedSummaries: string[] = [];
-				while (index < tailMessages.length && tailMessages[index]?.role === "toolResult") {
-					const toolMessage = tailMessages[index] as Extract<
-						Context["messages"][number],
-						{ role: "toolResult" }
-					>;
-					const shouldInclude = !allowedToolUseIds || allowedToolUseIds.has(toolMessage.toolCallId);
-					if (shouldInclude) {
-						const content = convertPiContentToBlocks(toolMessage.content, supportsImages);
-						const normalizedContent = normalizeToolResultContent(
-							content,
-							Boolean(toolMessage.isError),
-						);
-						toolResults.push({
-							type: "tool_result",
-							tool_use_id: toolMessage.toolCallId,
-							content: normalizedContent,
-							is_error: toolMessage.isError,
-						} as ContentBlockParam);
-					} else {
-						const plain = contentToPlainText(toolMessage.content).trim();
-						skippedSummaries.push(
-							`TOOL RESULT (already recorded ${toolMessage.toolName}, id=${toolMessage.toolCallId}): ${plain || (toolMessage.isError ? "(tool error with no output)" : "(no output)")}`,
-						);
-					}
-					index += 1;
-				}
-				if (toolResults.length > 0) {
-					yield {
-						type: "user" as const,
-						message: { role: "user", content: toolResults } as MessageParam,
-						parent_tool_use_id: null,
-						session_id: "prompt",
-					};
-				} else if (skippedSummaries.length > 0) {
-					yield {
-						type: "user" as const,
-						message: {
-							role: "user",
-							content: `Continue using the already-recorded tool outputs:\n${skippedSummaries.join("\n")}`,
-						} as MessageParam,
-						parent_tool_use_id: null,
-						session_id: "prompt",
-					};
-				}
-				continue;
-			}
-
-			index += 1;
-		}
-	}
-
-	return generator();
-}
-
-function findLastSdkAssistantInfo(
-	messages: Context["messages"],
-	state: SdkSessionState | undefined,
-): { index: number; timestamp: number; uuid: string } | undefined {
-	if (!state) return undefined;
-	for (let i = messages.length - 1; i >= 0; i -= 1) {
-		const message = messages[i];
-		if (message?.role !== "assistant") continue;
-		const timestamp = message.timestamp;
-		const uuid = state.uuidByAssistantTimestamp.get(timestamp);
-		if (uuid) {
-			return { index: i, timestamp, uuid };
-		}
-	}
-	return undefined;
 }
 
 function mapPiToolNameToSdk(name?: string, customToolNameToSdk?: Map<string, string>): string {
@@ -586,181 +282,6 @@ function readSettingsFile(filePath: string): ProviderSettings {
 	} catch {
 		return {};
 	}
-}
-
-function buildSessionKey(options: SimpleStreamOptions | undefined, cwd: string): string | undefined {
-	const sessionId = (options as { sessionId?: string } | undefined)?.sessionId;
-	if (typeof sessionId === "string" && sessionId.trim().length > 0) {
-		return `session:${sessionId.trim()}`;
-	}
-	if (cwd && cwd.trim().length > 0) {
-		return `cwd:${cwd}`;
-	}
-	return undefined;
-}
-
-function getSessionKeyFromManager(sessionManager: { getSessionId: () => string }): string {
-	return `session:${sessionManager.getSessionId()}`;
-}
-
-function createEmptySdkState(): SdkSessionState {
-	return {
-		sdkSessionId: undefined,
-		uuidByAssistantTimestamp: new Map(),
-		maxTimestamp: undefined,
-		pendingToolUseTimestamp: undefined,
-		pendingToolUseIds: undefined,
-	};
-}
-
-function buildSdkStateFromEntries(entries: Array<Record<string, any>>): SdkSessionState {
-	const state = createEmptySdkState();
-	for (const entry of entries) {
-		if (entry?.type !== "custom" || entry?.customType !== SDK_SESSION_CUSTOM_TYPE) continue;
-		const data = entry?.data as SdkSessionEntryData | undefined;
-		if (!data || typeof data !== "object") continue;
-		if (typeof data.sdkSessionId === "string" && data.sdkSessionId.trim().length > 0) {
-			state.sdkSessionId = data.sdkSessionId;
-		}
-		if (
-			typeof data.assistantTimestamp === "number" &&
-			Number.isFinite(data.assistantTimestamp) &&
-			typeof data.sdkAssistantUuid === "string" &&
-			data.sdkAssistantUuid.trim().length > 0
-		) {
-			state.uuidByAssistantTimestamp.set(data.assistantTimestamp, data.sdkAssistantUuid);
-			if (state.maxTimestamp == null || data.assistantTimestamp > state.maxTimestamp) {
-				state.maxTimestamp = data.assistantTimestamp;
-			}
-		}
-		if (data.pendingToolUseTimestamp === null) {
-			state.pendingToolUseTimestamp = undefined;
-		} else if (
-			typeof data.pendingToolUseTimestamp === "number" &&
-			Number.isFinite(data.pendingToolUseTimestamp)
-		) {
-			state.pendingToolUseTimestamp = data.pendingToolUseTimestamp;
-		}
-		if (data.pendingToolUseIds === null) {
-			state.pendingToolUseIds = undefined;
-		} else if (Array.isArray(data.pendingToolUseIds)) {
-			state.pendingToolUseIds = data.pendingToolUseIds.filter(
-				(id): id is string => typeof id === "string" && id.trim().length > 0,
-			);
-		}
-	}
-	return state;
-}
-
-function rebuildSessionState(sessionKey: string, entries: Array<Record<string, any>>, branchEntries: Array<Record<string, any>>): void {
-	const branchState = buildSdkStateFromEntries(branchEntries);
-	const allState = buildSdkStateFromEntries(entries);
-	if (!branchState.sdkSessionId && allState.sdkSessionId) {
-		branchState.sdkSessionId = allState.sdkSessionId;
-	}
-	sdkStateBySessionKey.set(sessionKey, { branch: branchState, all: allState });
-}
-
-function updateSessionState(sessionKey: string, data: SdkSessionEntryData): void {
-	const state = sdkStateBySessionKey.get(sessionKey) ?? {
-		branch: createEmptySdkState(),
-		all: createEmptySdkState(),
-	};
-
-	const apply = (target: SdkSessionState) => {
-		if (typeof data.sdkSessionId === "string" && data.sdkSessionId.trim().length > 0) {
-			target.sdkSessionId = data.sdkSessionId;
-		}
-		if (
-			typeof data.assistantTimestamp === "number" &&
-			Number.isFinite(data.assistantTimestamp) &&
-			typeof data.sdkAssistantUuid === "string" &&
-			data.sdkAssistantUuid.trim().length > 0
-		) {
-			target.uuidByAssistantTimestamp.set(data.assistantTimestamp, data.sdkAssistantUuid);
-			if (target.maxTimestamp == null || data.assistantTimestamp > target.maxTimestamp) {
-				target.maxTimestamp = data.assistantTimestamp;
-			}
-		}
-		if (data.pendingToolUseTimestamp === null) {
-			target.pendingToolUseTimestamp = undefined;
-		} else if (
-			typeof data.pendingToolUseTimestamp === "number" &&
-			Number.isFinite(data.pendingToolUseTimestamp)
-		) {
-			target.pendingToolUseTimestamp = data.pendingToolUseTimestamp;
-		}
-		if (data.pendingToolUseIds === null) {
-			target.pendingToolUseIds = undefined;
-		} else if (Array.isArray(data.pendingToolUseIds)) {
-			target.pendingToolUseIds = data.pendingToolUseIds.filter(
-				(id): id is string => typeof id === "string" && id.trim().length > 0,
-			);
-		}
-	};
-
-	apply(state.branch);
-	apply(state.all);
-	sdkStateBySessionKey.set(sessionKey, state);
-}
-
-function persistSdkEntry(sessionKey: string | undefined, data: SdkSessionEntryData): void {
-	if (!sessionKey) return;
-	updateSessionState(sessionKey, data);
-	if (!extensionApi) return;
-	try {
-		extensionApi.appendEntry(SDK_SESSION_CUSTOM_TYPE, data);
-	} catch {
-		// ignore persistence errors
-	}
-}
-
-function getSessionState(sessionKey: string): SessionSdkState | undefined {
-	return sdkStateBySessionKey.get(sessionKey);
-}
-
-function refreshSessionState(ctx: { sessionManager: { getSessionId: () => string; getEntries: () => any[]; getBranch: () => any[] } }): void {
-	const sessionKey = getSessionKeyFromManager(ctx.sessionManager);
-	rebuildSessionState(sessionKey, ctx.sessionManager.getEntries(), ctx.sessionManager.getBranch());
-}
-
-function getSdkSessionFilePath(sessionId: string, cwd: string): string {
-	let projectDir = cwd.replace(/[\\/]+/g, "-");
-	if (!projectDir.startsWith("-")) projectDir = `-${projectDir}`;
-	return join(homedir(), ".claude", "projects", projectDir, `${sessionId}.jsonl`);
-}
-
-function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
-	const ids = new Set<string>();
-	try {
-		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
-		if (!existsSync(sessionFilePath)) return ids;
-		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			let parsed: any;
-			try {
-				parsed = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (parsed?.type !== "user") continue;
-			const content = parsed?.message?.content;
-			if (!Array.isArray(content)) continue;
-			for (const block of content) {
-				if (
-					block?.type === "tool_result" &&
-					typeof block?.tool_use_id === "string" &&
-					block.tool_use_id.trim().length > 0
-				) {
-					ids.add(block.tool_use_id);
-				}
-			}
-		}
-	} catch {
-		// ignore parse/read failures
-	}
-	return ids;
 }
 
 function rewriteSkillsLocations(skillsBlock: string): string {
@@ -1018,19 +539,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let wasAborted = false;
 		const requestAbort = () => {
 			if (!sdkQuery) return;
-			try {
-				sdkQuery.close();
-			} catch {
-				// ignore shutdown errors
-			}
-		};
-		const requestClose = () => {
-			if (!sdkQuery) return;
-			try {
-				sdkQuery.close();
-			} catch {
-				// ignore shutdown errors
-			}
+			void sdkQuery.interrupt().catch(() => {
+				try {
+					sdkQuery?.close();
+				} catch {
+					// ignore shutdown errors
+				}
+			});
 		};
 		const onAbort = () => {
 			wasAborted = true;
@@ -1058,91 +573,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let sawStreamEvent = false;
 		let sawToolCall = false;
 		let shouldStopEarly = false;
-		let abortedForToolCall = false;
-		const pendingToolUseIds = new Set<string>();
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
+			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
+			const prompt = buildPromptStream(promptBlocks);
 
 			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-			const sessionKey = buildSessionKey(options, cwd);
-			const sessionState = sessionKey ? getSessionState(sessionKey) : undefined;
-			const branchState = sessionState?.branch;
-			const allState = sessionState?.all;
-			const supportsImages = model.input?.includes("image") ?? true;
-
-			let resumeSessionId: string | undefined;
-			let resumeSessionAt: string | undefined;
-			let forkSession: boolean | undefined;
-			let pendingAllowedToolUseIds: Set<string> | undefined;
-			let prompt: AsyncIterable<SDKUserMessage> | string;
-
-			if (!branchState?.sdkSessionId) {
-				prompt = buildPromptStream(buildPromptBlocks(context, customToolNameToSdk));
-			} else {
-				const lastSdkInfo = findLastSdkAssistantInfo(context.messages, branchState);
-				if (!lastSdkInfo) {
-					prompt = buildPromptStream(buildPromptBlocks(context, customToolNameToSdk));
-				} else {
-					resumeSessionId = branchState.sdkSessionId;
-					const tailMessages = context.messages.slice(lastSdkInfo.index + 1);
-					const tailHasAssistant = tailMessages.some((message) => message.role === "assistant");
-					if (tailHasAssistant) {
-						let lastUserIndex = -1;
-						for (let i = tailMessages.length - 1; i >= 0; i -= 1) {
-							if (tailMessages[i]?.role === "user") {
-								lastUserIndex = i;
-								break;
-							}
-						}
-						const summaryMessages = lastUserIndex >= 0 ? tailMessages.slice(0, lastUserIndex) : tailMessages;
-						const summaryText = buildHistoricalSummary(summaryMessages, customToolNameToSdk);
-						const userMessage =
-							lastUserIndex >= 0
-								? (tailMessages[lastUserIndex] as Extract<Context["messages"][number], { role: "user" }>)
-								: undefined;
-						prompt = buildPromptWithSummary(summaryText, userMessage, supportsImages);
-					} else {
-						prompt = buildResumePromptFromTail(tailMessages, supportsImages, pendingAllowedToolUseIds);
-					}
-
-					if (
-						branchState.maxTimestamp != null &&
-						allState?.maxTimestamp != null &&
-						branchState.maxTimestamp < allState.maxTimestamp
-					) {
-						resumeSessionAt = branchState.uuidByAssistantTimestamp.get(branchState.maxTimestamp);
-						forkSession = Boolean(resumeSessionAt);
-					}
-					if (branchState.pendingToolUseTimestamp != null) {
-						const pendingUuid = branchState.uuidByAssistantTimestamp.get(
-							branchState.pendingToolUseTimestamp,
-						);
-						if (pendingUuid) {
-							resumeSessionAt = pendingUuid;
-							forkSession = true;
-						}
-						if (forkSession) {
-							pendingAllowedToolUseIds = new Set(branchState.pendingToolUseIds ?? []);
-						} else {
-							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
-							pendingAllowedToolUseIds = new Set(
-								(branchState.pendingToolUseIds ?? []).filter((id) => !existingToolResultIds.has(id)),
-							);
-						}
-						if (!tailHasAssistant) {
-							prompt = buildResumePromptFromTail(tailMessages, supportsImages, pendingAllowedToolUseIds);
-						}
-						persistSdkEntry(sessionKey, {
-							providerId: PROVIDER_ID,
-							pendingToolUseTimestamp: null,
-							pendingToolUseIds: null,
-						});
-					}
-				}
-			}
-
-			const useResume = Boolean(resumeSessionId);
 
 			const mcpServers = buildCustomToolServers(customTools);
 			const providerSettings = loadProviderSettings();
@@ -1167,25 +604,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 				cwd,
 				tools: sdkTools,
-				permissionMode: "default",
+				permissionMode: "dontAsk",
 				includePartialMessages: true,
-				persistSession: true,
-				...(useResume && resumeSessionId ? { resume: resumeSessionId } : {}),
-				...(useResume && resumeSessionAt ? { resumeSessionAt } : {}),
-				...(useResume && forkSession ? { forkSession } : {}),
-				canUseTool: async (_toolName, _input, permissionOptions) => {
-					return {
-						behavior: "deny" as const,
-						message: TOOL_EXECUTION_DENIED_MESSAGE,
-						interrupt: true,
-						toolUseID: permissionOptions.toolUseID,
-					};
-				},
-				systemPrompt: {
-					type: "preset",
-					preset: "claude_code",
-					append: systemPromptAppend ? systemPromptAppend : undefined,
-				},
+				canUseTool: async () => ({
+					behavior: "deny",
+					message: TOOL_EXECUTION_DENIED_MESSAGE,
+				}),
+				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
 				...(mcpServers ? { mcpServers } : {}),
@@ -1202,44 +627,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 
 			if (wasAborted) {
-				requestClose();
+				requestAbort();
 			}
 
 			for await (const message of sdkQuery) {
-				if (wasAborted || options?.signal?.aborted) {
-					requestClose();
-					break;
-				}
 				if (!started) {
 					stream.push({ type: "start", partial: output });
 					started = true;
 				}
 
 				switch (message.type) {
-					case "system": {
-						const systemMessage = message as { subtype?: string; session_id?: string };
-						if (systemMessage.subtype === "init" && systemMessage.session_id) {
-							persistSdkEntry(sessionKey, {
-								providerId: PROVIDER_ID,
-								sdkSessionId: systemMessage.session_id,
-							});
-						}
-						break;
-					}
-					case "assistant": {
-						const assistantMessage = message as { message?: { role?: string }; uuid?: string; session_id?: string; parent_tool_use_id?: string | null };
-						if (assistantMessage.message?.role === "assistant" && !assistantMessage.parent_tool_use_id) {
-							if (assistantMessage.uuid) {
-								persistSdkEntry(sessionKey, {
-									providerId: PROVIDER_ID,
-									sdkSessionId: assistantMessage.session_id,
-									sdkAssistantUuid: assistantMessage.uuid,
-									assistantTimestamp: output.timestamp,
-								});
-							}
-						}
-						break;
-					}
 					case "stream_event": {
 						sawStreamEvent = true;
 						const event = (message as SDKMessage & { event: any }).event;
@@ -1356,7 +753,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									allowSkillAliasRewrite,
 								);
 								delete (block as any).partialJson;
-								pendingToolUseIds.add(block.id);
 								stream.push({
 									type: "toolcall_end",
 									contentIndex: index,
@@ -1368,8 +764,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						}
 
 						if (event?.type === "message_delta") {
-							const stopReason = mapStopReason(event.delta?.stop_reason);
-							output.stopReason = stopReason;
+							output.stopReason = mapStopReason(event.delta?.stop_reason);
 							const usage = event.usage ?? {};
 							if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
 							if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
@@ -1378,31 +773,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							output.usage.totalTokens =
 								output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 							calculateCost(model, output.usage);
-							if (stopReason === "toolUse" && sawToolCall && !abortedForToolCall) {
-								abortedForToolCall = true;
-								shouldStopEarly = true;
-								persistSdkEntry(sessionKey, {
-									providerId: PROVIDER_ID,
-									pendingToolUseTimestamp: output.timestamp,
-									pendingToolUseIds: Array.from(pendingToolUseIds),
-								});
-								requestClose();
-							}
 							break;
 						}
 
 						if (event?.type === "message_stop" && sawToolCall) {
 							output.stopReason = "toolUse";
 							shouldStopEarly = true;
-							if (!abortedForToolCall) {
-								abortedForToolCall = true;
-								persistSdkEntry(sessionKey, {
-									providerId: PROVIDER_ID,
-									pendingToolUseTimestamp: output.timestamp,
-									pendingToolUseIds: Array.from(pendingToolUseIds),
-								});
-								requestClose();
-							}
 							break;
 						}
 
@@ -1437,9 +813,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 			stream.end();
 		} catch (error) {
-			const aborted = Boolean(wasAborted || options?.signal?.aborted);
-			output.stopReason = aborted ? "aborted" : "error";
-			output.errorMessage = aborted ? "Operation aborted" : error instanceof Error ? error.message : String(error);
+			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorMessage = error instanceof Error ? error.message : String(error);
 			stream.push({ type: "error", reason: output.stopReason as "aborted" | "error", error: output });
 			stream.end();
 		} finally {
@@ -1454,24 +829,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 }
 
 export default function (pi: ExtensionAPI) {
-	extensionApi = pi;
-
-	pi.on("session_start", (_event, ctx) => {
-		refreshSessionState(ctx);
-	});
-
-	pi.on("session_switch", (_event, ctx) => {
-		refreshSessionState(ctx);
-	});
-
-	pi.on("session_tree", (_event, ctx) => {
-		refreshSessionState(ctx);
-	});
-
-	pi.on("session_fork", (_event, ctx) => {
-		refreshSessionState(ctx);
-	});
-
 	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: "claude-agent-sdk",
 		apiKey: "ANTHROPIC_API_KEY",
