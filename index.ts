@@ -1122,10 +1122,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							resumeSessionAt = pendingUuid;
 							forkSession = true;
 						}
-						const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
-						pendingAllowedToolUseIds = new Set(
-							(branchState.pendingToolUseIds ?? []).filter((id) => !existingToolResultIds.has(id)),
-						);
+						if (forkSession) {
+							pendingAllowedToolUseIds = new Set(branchState.pendingToolUseIds ?? []);
+						} else {
+							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
+							pendingAllowedToolUseIds = new Set(
+								(branchState.pendingToolUseIds ?? []).filter((id) => !existingToolResultIds.has(id)),
+							);
+						}
 						if (!tailHasAssistant) {
 							prompt = buildResumePromptFromTail(tailMessages, supportsImages, pendingAllowedToolUseIds);
 						}
