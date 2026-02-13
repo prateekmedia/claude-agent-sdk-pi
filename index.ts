@@ -391,6 +391,18 @@ function normalizeToolResultContent(
 	return content;
 }
 
+function collectToolResultIds(messages: Context["messages"]): Set<string> {
+	const ids = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "toolResult") continue;
+		const id = (message as Extract<Context["messages"][number], { role: "toolResult" }>).toolCallId;
+		if (typeof id === "string" && id.trim().length > 0) {
+			ids.add(id);
+		}
+	}
+	return ids;
+}
+
 function buildResumePromptFromTail(
 	tailMessages: Context["messages"],
 	supportsImages: boolean,
@@ -427,6 +439,7 @@ function buildResumePromptFromTail(
 
 			if (message.role === "toolResult") {
 				const toolResults: ContentBlockParam[] = [];
+				const toolResultIndexById = new Map<string, number>();
 				const skippedSummaries: string[] = [];
 				while (index < tailMessages.length && tailMessages[index]?.role === "toolResult") {
 					const toolMessage = tailMessages[index] as Extract<
@@ -440,12 +453,19 @@ function buildResumePromptFromTail(
 							content,
 							Boolean(toolMessage.isError),
 						);
-						toolResults.push({
+						const existingIndex = toolResultIndexById.get(toolMessage.toolCallId);
+						const toolResult: ContentBlockParam = {
 							type: "tool_result",
 							tool_use_id: toolMessage.toolCallId,
 							content: normalizedContent,
 							is_error: toolMessage.isError,
-						} as ContentBlockParam);
+						} as ContentBlockParam;
+						if (existingIndex == null) {
+							toolResultIndexById.set(toolMessage.toolCallId, toolResults.length);
+							toolResults.push(toolResult);
+						} else {
+							toolResults[existingIndex] = toolResult;
+						}
 					} else {
 						const plain = contentToPlainText(toolMessage.content).trim();
 						skippedSummaries.push(
@@ -1109,7 +1129,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			let resumeSessionId: string | undefined;
 			let resumeSessionAt: string | undefined;
 			let forkSession: boolean | undefined;
-			let pendingAllowedToolUseIds: Set<string> | undefined;
 			let prompt: AsyncIterable<SDKUserMessage> | string;
 
 			if (!branchState?.sdkSessionId) {
@@ -1122,6 +1141,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					resumeSessionId = branchState.sdkSessionId;
 					const tailMessages = context.messages.slice(lastSdkInfo.index + 1);
 					const tailHasAssistant = tailMessages.some((message) => message.role === "assistant");
+					let tailAllowedToolUseIds = !tailHasAssistant ? collectToolResultIds(tailMessages) : undefined;
 					if (tailHasAssistant) {
 						let lastUserIndex = -1;
 						for (let i = tailMessages.length - 1; i >= 0; i -= 1) {
@@ -1137,8 +1157,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								? (tailMessages[lastUserIndex] as Extract<Context["messages"][number], { role: "user" }>)
 								: undefined;
 						prompt = buildPromptWithSummary(summaryText, userMessage, supportsImages);
-					} else {
-						prompt = buildResumePromptFromTail(tailMessages, supportsImages, pendingAllowedToolUseIds);
+					} else if (resumeSessionId) {
+						const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
+						if (existingToolResultIds.size > 0 && tailAllowedToolUseIds) {
+							tailAllowedToolUseIds = new Set(
+								[...tailAllowedToolUseIds].filter((id) => !existingToolResultIds.has(id)),
+							);
+						}
 					}
 
 					if (
@@ -1157,24 +1182,29 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							resumeSessionAt = pendingUuid;
 							forkSession = true;
 						}
-						if (forkSession) {
-							pendingAllowedToolUseIds = new Set(branchState.pendingToolUseIds ?? []);
-						} else {
-							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
-							pendingAllowedToolUseIds = new Set(
-								(branchState.pendingToolUseIds ?? []).filter((id) => !existingToolResultIds.has(id)),
-							);
+						if (branchState.pendingToolUseIds?.length) {
+							const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds);
+							if (!tailAllowedToolUseIds) {
+								tailAllowedToolUseIds = pendingToolUseIdSet;
+							} else {
+								tailAllowedToolUseIds = new Set(
+									[...tailAllowedToolUseIds].filter((id) => pendingToolUseIdSet.has(id)),
+								);
+							}
 						}
 						if (!tailHasAssistant) {
-							prompt = buildResumePromptFromTail(tailMessages, supportsImages, pendingAllowedToolUseIds);
+							prompt = buildResumePromptFromTail(tailMessages, supportsImages, tailAllowedToolUseIds);
 						}
 						persistSdkEntry(sessionKey, {
 							providerId: PROVIDER_ID,
 							pendingToolUseTimestamp: null,
 							pendingToolUseIds: null,
 						});
+					} else if (!tailHasAssistant) {
+						prompt = buildResumePromptFromTail(tailMessages, supportsImages, tailAllowedToolUseIds);
 					}
 				}
+
 			}
 
 			const useResume = Boolean(resumeSessionId);
