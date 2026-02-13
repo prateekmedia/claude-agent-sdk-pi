@@ -43,6 +43,292 @@ const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
+const TOOL_WATCH_CUSTOM_TYPE = "claude-agent-sdk-tool-watch";
+const MAX_TRACKED_TOOL_EXECUTIONS = 256;
+const MAX_TRACKED_TOOL_CONTENT_CHARS = 4000;
+const MAX_LEDGER_TOOL_RESULTS = 4;
+const MAX_LEDGER_TOOL_CONTENT_CHARS = 1200;
+
+type ToolWatchCustomEntryData = {
+	type: "tool_execution_end";
+	toolCallId: string;
+	toolName: string;
+	content: string;
+	isError: boolean;
+	timestamp: number;
+};
+
+type PendingToolCall = {
+	toolName: string;
+	timestamp: number;
+};
+
+type TrackedToolExecution = {
+	toolCallId: string;
+	toolName: string;
+	content: string;
+	isError: boolean;
+	timestamp: number;
+};
+
+type SessionToolWatchState = {
+	pendingToolCalls: Map<string, PendingToolCall>;
+	completedToolCalls: Map<string, TrackedToolExecution>;
+};
+
+const toolWatchStateBySession = new Map<string, SessionToolWatchState>();
+let activeSessionKey: string | undefined;
+let extensionApi: ExtensionAPI | undefined;
+
+function createEmptyToolWatchState(): SessionToolWatchState {
+	return {
+		pendingToolCalls: new Map(),
+		completedToolCalls: new Map(),
+	};
+}
+
+function getOrCreateToolWatchState(sessionKey: string): SessionToolWatchState {
+	const existing = toolWatchStateBySession.get(sessionKey);
+	if (existing) return existing;
+	const created = createEmptyToolWatchState();
+	toolWatchStateBySession.set(sessionKey, created);
+	return created;
+}
+
+function getSessionKeyFromSessionId(sessionId?: string): string | undefined {
+	if (!sessionId) return undefined;
+	return `session:${sessionId}`;
+}
+
+function getSessionKeyFromStreamOptions(options?: SimpleStreamOptions): string | undefined {
+	const fromOptions = getSessionKeyFromSessionId(options?.sessionId);
+	if (fromOptions) return fromOptions;
+	return activeSessionKey;
+}
+
+function getSessionKeyFromContext(ctx?: { sessionManager?: { getSessionId?: () => string } }): string | undefined {
+	const sessionId = ctx?.sessionManager?.getSessionId?.();
+	if (!sessionId) return undefined;
+	return getSessionKeyFromSessionId(sessionId);
+}
+
+function truncateText(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	return `${text.slice(0, limit)}\n...[truncated]`;
+}
+
+function stringifyUnknown(value: unknown): string {
+	if (typeof value === "string") return value;
+	try {
+		return JSON.stringify(value, null, 2);
+	} catch {
+		return String(value);
+	}
+}
+
+function contentToPlainText(
+	content:
+		| string
+		| Array<{
+			type?: string;
+			text?: string;
+			mimeType?: string;
+		}>
+		| undefined,
+): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) => {
+			if (block?.type === "text") return block.text ?? "";
+			if (block?.type === "image") return `[image:${block.mimeType ?? "unknown"}]`;
+			if (block?.type) return `[${block.type}]`;
+			return "";
+		})
+		.filter((line) => line.length > 0)
+		.join("\n");
+}
+
+function extractToolExecutionContent(result: unknown): string {
+	if (result && typeof result === "object" && "content" in result) {
+		const objectResult = result as { content?: unknown };
+		const text = contentToPlainText(
+			Array.isArray(objectResult.content)
+				? (objectResult.content as Array<{ type?: string; text?: string; mimeType?: string }>)
+				: undefined,
+		);
+		if (text) return truncateText(text, MAX_TRACKED_TOOL_CONTENT_CHARS);
+	}
+	const fallback = stringifyUnknown(result);
+	return truncateText(fallback, MAX_TRACKED_TOOL_CONTENT_CHARS);
+}
+
+function collectAssistantToolCalls(message: unknown): Array<{ id: string; name: string }> {
+	if (!message || typeof message !== "object") return [];
+	const assistantMessage = message as {
+		role?: string;
+		content?: Array<{ type?: string; id?: string; name?: string }>;
+	};
+	if (assistantMessage.role !== "assistant" || !Array.isArray(assistantMessage.content)) return [];
+	return assistantMessage.content
+		.filter((block): block is { type: "toolCall"; id: string; name: string } => {
+			return block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string";
+		})
+		.map((block) => ({ id: block.id, name: block.name }));
+}
+
+function trackPendingToolCall(sessionKey: string, toolCallId: string, toolName: string, timestamp: number): void {
+	const state = getOrCreateToolWatchState(sessionKey);
+	if (state.completedToolCalls.has(toolCallId)) return;
+	state.pendingToolCalls.set(toolCallId, { toolName, timestamp });
+}
+
+function trackCompletedToolCall(sessionKey: string, execution: TrackedToolExecution): void {
+	const state = getOrCreateToolWatchState(sessionKey);
+	state.pendingToolCalls.delete(execution.toolCallId);
+	state.completedToolCalls.delete(execution.toolCallId);
+	state.completedToolCalls.set(execution.toolCallId, execution);
+	while (state.completedToolCalls.size > MAX_TRACKED_TOOL_EXECUTIONS) {
+		const oldestKey = state.completedToolCalls.keys().next().value;
+		if (!oldestKey) break;
+		state.completedToolCalls.delete(oldestKey);
+	}
+}
+
+function hydrateToolWatchStateFromEntries(sessionKey: string, entries: Array<Record<string, any>>): void {
+	toolWatchStateBySession.set(sessionKey, createEmptyToolWatchState());
+	for (const entry of entries) {
+		if (entry.type === "message") {
+			const message = entry.message;
+			const messageTimestamp = typeof message?.timestamp === "number" ? message.timestamp : Date.now();
+			if (message?.role === "assistant") {
+				for (const toolCall of collectAssistantToolCalls(message)) {
+					trackPendingToolCall(sessionKey, toolCall.id, toolCall.name, messageTimestamp);
+				}
+				continue;
+			}
+			if (message?.role === "toolResult") {
+				if (typeof message.toolCallId === "string" && typeof message.toolName === "string") {
+					trackCompletedToolCall(sessionKey, {
+						toolCallId: message.toolCallId,
+						toolName: message.toolName,
+						content: truncateText(contentToPlainText(message.content), MAX_TRACKED_TOOL_CONTENT_CHARS),
+						isError: message.isError === true,
+						timestamp: typeof message.timestamp === "number" ? message.timestamp : Date.now(),
+					});
+				}
+			}
+			continue;
+		}
+		if (entry.type === "custom" && entry.customType === TOOL_WATCH_CUSTOM_TYPE) {
+			const data = entry.data as ToolWatchCustomEntryData | undefined;
+			if (!data || data.type !== "tool_execution_end") continue;
+			if (!data.toolCallId || !data.toolName) continue;
+			trackCompletedToolCall(sessionKey, {
+				toolCallId: data.toolCallId,
+				toolName: data.toolName,
+				content: truncateText(data.content ?? "", MAX_TRACKED_TOOL_CONTENT_CHARS),
+				isError: data.isError === true,
+				timestamp: typeof data.timestamp === "number" ? data.timestamp : Date.now(),
+			});
+		}
+	}
+}
+
+function reconcileToolWatchStateWithContext(sessionKey: string, context: Context): void {
+	const state = toolWatchStateBySession.get(sessionKey);
+	if (!state) return;
+	for (const message of context.messages) {
+		if (message.role === "assistant") {
+			for (const toolCall of collectAssistantToolCalls(message)) {
+				if (!state.completedToolCalls.has(toolCall.id)) {
+					trackPendingToolCall(sessionKey, toolCall.id, toolCall.name, message.timestamp);
+				}
+			}
+			continue;
+		}
+		if (message.role === "toolResult") {
+			state.pendingToolCalls.delete(message.toolCallId);
+			if (!state.completedToolCalls.has(message.toolCallId)) {
+				trackCompletedToolCall(sessionKey, {
+					toolCallId: message.toolCallId,
+					toolName: message.toolName,
+					content: truncateText(contentToPlainText(message.content), MAX_TRACKED_TOOL_CONTENT_CHARS),
+					isError: message.isError,
+					timestamp: message.timestamp,
+				});
+			}
+		}
+	}
+}
+
+function buildToolWatchPromptNote(
+	sessionKey: string | undefined,
+	context: Context,
+	customToolNameToSdk?: Map<string, string>,
+): string | undefined {
+	if (!sessionKey) return undefined;
+	const state = toolWatchStateBySession.get(sessionKey);
+	if (!state) return undefined;
+
+	const toolResultIdsInContext = new Set<string>();
+	const assistantToolIdsInContext = new Set<string>();
+	for (const message of context.messages) {
+		if (message.role === "assistant") {
+			for (const toolCall of collectAssistantToolCalls(message)) {
+				assistantToolIdsInContext.add(toolCall.id);
+			}
+			continue;
+		}
+		if (message.role === "toolResult") {
+			toolResultIdsInContext.add(message.toolCallId);
+		}
+	}
+
+	const recoveredExecutions = Array.from(state.completedToolCalls.values())
+		.filter((execution) => {
+			if (toolResultIdsInContext.has(execution.toolCallId)) return false;
+			return assistantToolIdsInContext.has(execution.toolCallId) || state.pendingToolCalls.has(execution.toolCallId);
+		})
+		.sort((a, b) => b.timestamp - a.timestamp)
+		.slice(0, MAX_LEDGER_TOOL_RESULTS);
+
+	const unresolvedToolCalls = Array.from(state.pendingToolCalls.entries())
+		.filter(([toolCallId]) => {
+			if (toolResultIdsInContext.has(toolCallId)) return false;
+			return assistantToolIdsInContext.has(toolCallId);
+		})
+		.sort((a, b) => b[1].timestamp - a[1].timestamp)
+		.slice(0, MAX_LEDGER_TOOL_RESULTS);
+
+	if (!recoveredExecutions.length && !unresolvedToolCalls.length) return undefined;
+
+	const parts: string[] = [];
+
+	if (recoveredExecutions.length) {
+		for (const execution of recoveredExecutions) {
+			const sdkToolName = mapPiToolNameToSdk(execution.toolName, customToolNameToSdk);
+			const status = execution.isError ? "error" : "ok";
+			const content = truncateText(execution.content || "(empty tool result)", MAX_LEDGER_TOOL_CONTENT_CHARS);
+			parts.push(
+				`TOOL RESULT (recovered ${sdkToolName}, id=${execution.toolCallId}, status=${status}):\n${content}`,
+			);
+		}
+	}
+
+	if (unresolvedToolCalls.length) {
+		for (const [toolCallId, pending] of unresolvedToolCalls) {
+			const sdkToolName = mapPiToolNameToSdk(pending.toolName, customToolNameToSdk);
+			parts.push(
+				`TOOL RESULT (missing execution ${sdkToolName}, id=${toolCallId}, status=error):\n` +
+					"Tool execution did not complete or its result was not observed. Do not guess. Call the tool again.",
+			);
+		}
+	}
+
+	return parts.join("\n\n");
+}
+
 const MODELS = getModels("anthropic").map((model) => ({
 	id: model.id,
 	name: model.name,
@@ -57,6 +343,7 @@ const MODELS = getModels("anthropic").map((model) => ({
 function buildPromptBlocks(
 	context: Context,
 	customToolNameToSdk: Map<string, string> | undefined,
+	toolWatchNote?: string,
 ): ContentBlockParam[] {
 	const blocks: ContentBlockParam[] = [];
 
@@ -135,13 +422,18 @@ function buildPromptBlocks(
 		}
 
 		if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}):`;
+			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}, id=${message.toolCallId}):`;
 			pushPrefix(header);
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
 				pushText("(see attached image)");
 			}
 		}
+	}
+
+	if (toolWatchNote && toolWatchNote.trim().length > 0) {
+		pushPrefix("RECOVERED TOOL RESULTS:");
+		pushText(toolWatchNote.trim());
 	}
 
 	if (!blocks.length) return [{ type: "text", text: "" }];
@@ -611,7 +903,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
-			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
+			const sessionKey = getSessionKeyFromStreamOptions(options);
+			if (sessionKey) {
+				reconcileToolWatchStateWithContext(sessionKey, context);
+			}
+			const toolWatchNote = buildToolWatchPromptNote(sessionKey, context, customToolNameToSdk);
+			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk, toolWatchNote);
 			const prompt = buildPromptStream(promptBlocks);
 
 			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
@@ -864,6 +1161,149 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 }
 
 export default function (pi: ExtensionAPI) {
+	extensionApi = pi;
+
+	const refreshToolWatchState = (
+		ctx: {
+			sessionManager?: { getSessionId?: () => string; getBranch?: () => Array<Record<string, any>> };
+			model?: { provider?: string };
+		},
+		providerOverride?: string,
+	) => {
+		const sessionKey = getSessionKeyFromContext(ctx);
+		if (!sessionKey) return;
+		activeSessionKey = sessionKey;
+		const provider = providerOverride ?? ctx.model?.provider;
+		if (provider !== PROVIDER_ID) {
+			toolWatchStateBySession.delete(sessionKey);
+			return;
+		}
+		const entries = ctx.sessionManager?.getBranch?.() ?? [];
+		hydrateToolWatchStateFromEntries(sessionKey, entries);
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		refreshToolWatchState(ctx);
+	});
+
+	pi.on("session_switch", (_event, ctx) => {
+		refreshToolWatchState(ctx);
+	});
+
+	pi.on("session_fork", (_event, ctx) => {
+		refreshToolWatchState(ctx);
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		const provider = (event as { model?: { provider?: string } }).model?.provider;
+		if (provider !== PROVIDER_ID) return;
+		refreshToolWatchState(ctx, provider);
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		const sessionKey = getSessionKeyFromContext(ctx);
+		if (!sessionKey) return;
+		toolWatchStateBySession.delete(sessionKey);
+		if (activeSessionKey === sessionKey) {
+			activeSessionKey = undefined;
+		}
+	});
+
+	const registerLooseEvent = (
+		eventName: string,
+		handler: (event: Record<string, unknown>, ctx: Record<string, any>) => void,
+	) => {
+		const on = pi.on as unknown as (
+			event: string,
+			handler: (event: Record<string, unknown>, ctx: Record<string, any>) => void,
+		) => void;
+		on(eventName, handler);
+	};
+
+	registerLooseEvent("message_end", (event, ctx) => {
+		const provider = ctx?.model?.provider;
+		if (provider !== PROVIDER_ID) return;
+		const sessionKey = getSessionKeyFromContext(ctx);
+		if (!sessionKey) return;
+		activeSessionKey = sessionKey;
+
+		const message = (event as { message?: unknown }).message;
+		if (!message || typeof message !== "object") return;
+		const role = (message as { role?: string }).role;
+		const timestampValue = (message as { timestamp?: unknown }).timestamp;
+		const timestamp = typeof timestampValue === "number" ? timestampValue : Date.now();
+
+		if (role === "assistant") {
+			for (const toolCall of collectAssistantToolCalls(message)) {
+				trackPendingToolCall(sessionKey, toolCall.id, toolCall.name, timestamp);
+			}
+			return;
+		}
+
+		if (role === "toolResult") {
+			const toolResult = message as {
+				toolCallId?: string;
+				toolName?: string;
+				content?: unknown;
+				isError?: boolean;
+			};
+			if (!toolResult.toolCallId || !toolResult.toolName) return;
+			trackCompletedToolCall(sessionKey, {
+				toolCallId: toolResult.toolCallId,
+				toolName: toolResult.toolName,
+				content: truncateText(contentToPlainText(toolResult.content as any), MAX_TRACKED_TOOL_CONTENT_CHARS),
+				isError: toolResult.isError === true,
+				timestamp,
+			});
+		}
+	});
+
+	registerLooseEvent("tool_execution_start", (event, ctx) => {
+		const provider = ctx?.model?.provider;
+		if (provider !== PROVIDER_ID) return;
+		const sessionKey = getSessionKeyFromContext(ctx);
+		if (!sessionKey) return;
+		activeSessionKey = sessionKey;
+
+		const toolCallId = (event as { toolCallId?: unknown }).toolCallId;
+		const toolName = (event as { toolName?: unknown }).toolName;
+		if (typeof toolCallId !== "string" || typeof toolName !== "string") return;
+		trackPendingToolCall(sessionKey, toolCallId, toolName, Date.now());
+	});
+
+	registerLooseEvent("tool_execution_end", (event, ctx) => {
+		const provider = ctx?.model?.provider;
+		if (provider !== PROVIDER_ID) return;
+		const sessionKey = getSessionKeyFromContext(ctx);
+		if (!sessionKey) return;
+		activeSessionKey = sessionKey;
+
+		const toolCallId = (event as { toolCallId?: unknown }).toolCallId;
+		const toolName = (event as { toolName?: unknown }).toolName;
+		if (typeof toolCallId !== "string" || typeof toolName !== "string") return;
+
+		const timestamp = Date.now();
+		const content = extractToolExecutionContent((event as { result?: unknown }).result);
+		const isError = (event as { isError?: unknown }).isError === true;
+
+		trackCompletedToolCall(sessionKey, {
+			toolCallId,
+			toolName,
+			content,
+			isError,
+			timestamp,
+		});
+
+		extensionApi?.appendEntry<ToolWatchCustomEntryData>(TOOL_WATCH_CUSTOM_TYPE, {
+			type: "tool_execution_end",
+			toolCallId,
+			toolName,
+			content,
+			isError,
+			timestamp,
+		});
+	});
+
 	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: "claude-agent-sdk",
 		apiKey: "ANTHROPIC_API_KEY",
