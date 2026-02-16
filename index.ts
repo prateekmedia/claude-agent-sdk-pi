@@ -1420,6 +1420,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const pendingToolUseIds = new Set<string>();
 		const announcedToolCallIndices = new Set<number>();
 		const emittedToolCallDeltaIndices = new Set<number>();
+		const clearStaleBlockIndex = (eventIndex: number) => {
+			for (const existingBlock of blocks) {
+				if ((existingBlock as any).index === eventIndex) {
+					delete (existingBlock as any).index;
+				}
+			}
+		};
+		const findLatestBlockIndex = (eventIndex: number) => {
+			for (let i = blocks.length - 1; i >= 0; i -= 1) {
+				if ((blocks[i] as any).index === eventIndex) return i;
+			}
+			return -1;
+		};
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
@@ -1615,6 +1628,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						const event = (message as SDKMessage & { event: any }).event;
 
 						if (event?.type === "message_start") {
+							for (const existingBlock of blocks) {
+								if ("index" in (existingBlock as any)) {
+									delete (existingBlock as any).index;
+								}
+							}
+							announcedToolCallIndices.clear();
+							emittedToolCallDeltaIndices.clear();
 							const usage = event.message?.usage;
 							output.usage.input = usage?.input_tokens ?? 0;
 							output.usage.output = usage?.output_tokens ?? 0;
@@ -1627,6 +1647,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						}
 
 						if (event?.type === "content_block_start") {
+							clearStaleBlockIndex(event.index);
 							if (event.content_block?.type === "text") {
 								const block = { type: "text", text: "", index: event.index } as const;
 								output.content.push(block);
@@ -1664,7 +1685,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 						if (event?.type === "content_block_delta") {
 							if (event.delta?.type === "text_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "text") {
 									block.text += event.delta.text;
@@ -1676,7 +1697,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									});
 								}
 							} else if (event.delta?.type === "thinking_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "thinking") {
 									block.thinking += event.delta.thinking;
@@ -1688,7 +1709,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									});
 								}
 							} else if (event.delta?.type === "input_json_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "toolCall") {
 									block.partialJson += event.delta.partial_json;
@@ -1709,7 +1730,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									}
 								}
 							} else if (event.delta?.type === "signature_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "thinking") {
 									block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
@@ -1719,7 +1740,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						}
 
 						if (event?.type === "content_block_stop") {
-							const index = blocks.findIndex((block) => block.index === event.index);
+							const index = findLatestBlockIndex(event.index);
 							const block = blocks[index];
 							if (!block) break;
 							delete (block as any).index;
