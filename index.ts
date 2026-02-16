@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
 
@@ -68,6 +68,18 @@ type SessionSdkState = {
 };
 
 const sdkStateBySessionKey = new Map<string, SessionSdkState>();
+
+type PiSessionSdkStateCacheEntry = {
+	sessionFilePath: string;
+	mtimeMs: number;
+	size: number;
+	state: SdkSessionState;
+};
+
+const piSessionSdkStateCache = new Map<string, PiSessionSdkStateCacheEntry>();
+const piSessionFilePathCache = new Map<string, string>();
+const piSessionFileBySessionKey = new Map<string, string>();
+
 let extensionApi: ExtensionAPI | undefined;
 
 const MODELS = getModels("anthropic").map((model) => ({
@@ -339,33 +351,62 @@ function buildPromptWithSummary(
 	if (!summaryText && !userMessage) return "";
 
 	async function* generator() {
-		if (summaryText.trim().length > 0) {
-			yield {
-				type: "user" as const,
-				message: { role: "user", content: summaryText } as MessageParam,
-				parent_tool_use_id: null,
-				session_id: "prompt",
-			};
-		}
-		if (userMessage) {
-			const content = convertPiContentToBlocks(userMessage.content, supportsImages);
-			if (typeof content === "string") {
-				if (content.trim().length > 0) {
-					yield {
-						type: "user" as const,
-						message: { role: "user", content } as MessageParam,
-						parent_tool_use_id: null,
-						session_id: "prompt",
-					};
-				}
-			} else if (content.length > 0) {
+		const trimmedSummary = summaryText.trim();
+		if (!userMessage) {
+			if (trimmedSummary.length > 0) {
 				yield {
 					type: "user" as const,
-					message: { role: "user", content } as MessageParam,
+					message: { role: "user", content: trimmedSummary } as MessageParam,
 					parent_tool_use_id: null,
 					session_id: "prompt",
 				};
 			}
+			return;
+		}
+
+		const content = convertPiContentToBlocks(userMessage.content, supportsImages);
+		if (typeof content === "string") {
+			const trimmedUser = content.trim();
+			const parts = [trimmedSummary].filter((part) => part.length > 0);
+			if (trimmedUser.length > 0) {
+				parts.push(`---\nLatest user message:\n${trimmedUser}`);
+			}
+			if (parts.length > 0) {
+				yield {
+					type: "user" as const,
+					message: { role: "user", content: parts.join("\n\n") } as MessageParam,
+					parent_tool_use_id: null,
+					session_id: "prompt",
+				};
+			}
+			return;
+		}
+
+		if (content.length > 0) {
+			const blocks: ContentBlockParam[] = [];
+			if (trimmedSummary.length > 0) {
+				blocks.push({
+					type: "text",
+					text: `${trimmedSummary}\n\n---\nLatest user message:`,
+				} as TextBlockParam);
+			}
+			blocks.push(...content);
+			yield {
+				type: "user" as const,
+				message: { role: "user", content: blocks } as MessageParam,
+				parent_tool_use_id: null,
+				session_id: "prompt",
+			};
+			return;
+		}
+
+		if (trimmedSummary.length > 0) {
+			yield {
+				type: "user" as const,
+				message: { role: "user", content: trimmedSummary } as MessageParam,
+				parent_tool_use_id: null,
+				session_id: "prompt",
+			};
 		}
 	}
 
@@ -401,6 +442,91 @@ function collectToolResultIds(messages: Context["messages"]): Set<string> {
 		}
 	}
 	return ids;
+}
+
+type ResumeTailPlan = {
+	tailHasAssistant: boolean;
+	summaryMessages: Context["messages"];
+	userMessage?: Extract<Context["messages"][number], { role: "user" }>;
+	shouldReplayPendingToolResults: boolean;
+	shouldUseSummaryPrompt: boolean;
+	tailAllowedToolUseIds?: Set<string>;
+};
+
+function analyzeResumeTailMessages(
+	tailMessages: Context["messages"],
+	pendingToolUseTimestamp?: number,
+): ResumeTailPlan {
+	const tailHasAssistant = tailMessages.some((message) => message.role === "assistant");
+	let lastUserIndex = -1;
+	for (let i = tailMessages.length - 1; i >= 0; i -= 1) {
+		if (tailMessages[i]?.role === "user") {
+			lastUserIndex = i;
+			break;
+		}
+	}
+
+	const summaryMessages = lastUserIndex >= 0 ? tailMessages.slice(0, lastUserIndex) : tailMessages;
+	const userMessage =
+		lastUserIndex >= 0
+			? (tailMessages[lastUserIndex] as Extract<Context["messages"][number], { role: "user" }>)
+			: undefined;
+	const shouldReplayPendingToolResults = pendingToolUseTimestamp != null && !tailHasAssistant;
+	const shouldUseSummaryPrompt = summaryMessages.length > 0 && !shouldReplayPendingToolResults;
+	const tailAllowedToolUseIds = !shouldUseSummaryPrompt ? collectToolResultIds(tailMessages) : undefined;
+
+	return {
+		tailHasAssistant,
+		summaryMessages,
+		userMessage,
+		shouldReplayPendingToolResults,
+		shouldUseSummaryPrompt,
+		tailAllowedToolUseIds,
+	};
+}
+
+function hasReplayableTailMessages(tailMessages: Context["messages"] | undefined): boolean {
+	if (!tailMessages || tailMessages.length === 0) {
+		return false;
+	}
+	for (const message of tailMessages) {
+		if (message.role === "user" || message.role === "toolResult") {
+			return true;
+		}
+	}
+	return false;
+}
+
+type ResumeForkPlan = {
+	resumeSessionAt?: string;
+	forkSession?: boolean;
+};
+
+function computeResumeForkPlan(
+	branchState: SdkSessionState | undefined,
+	allState: SdkSessionState | undefined,
+): ResumeForkPlan {
+	let resumeSessionAt: string | undefined;
+	let forkSession: boolean | undefined;
+
+	if (
+		branchState?.maxTimestamp != null &&
+		allState?.maxTimestamp != null &&
+		branchState.maxTimestamp < allState.maxTimestamp
+	) {
+		resumeSessionAt = branchState.uuidByAssistantTimestamp.get(branchState.maxTimestamp);
+		forkSession = Boolean(resumeSessionAt);
+	}
+
+	if (branchState?.pendingToolUseTimestamp != null) {
+		const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
+		if (pendingUuid) {
+			resumeSessionAt = pendingUuid;
+			forkSession = true;
+		}
+	}
+
+	return { resumeSessionAt, forkSession };
 }
 
 function buildResumePromptFromTail(
@@ -502,6 +628,16 @@ function buildResumePromptFromTail(
 	return generator();
 }
 
+function isErroredAssistantMessage(message: Extract<Context["messages"][number], { role: "assistant" }>): boolean {
+	if (message.stopReason === "error") return true;
+	if (typeof message.errorMessage === "string" && message.errorMessage.trim().length > 0) return true;
+	const text = contentToText(message.content).trim().toLowerCase();
+	if (!text) return false;
+	if (text.startsWith("api error:")) return true;
+	if (text.includes("does not support assistant message prefill")) return true;
+	return false;
+}
+
 function findLastSdkAssistantInfo(
 	messages: Context["messages"],
 	state: SdkSessionState | undefined,
@@ -510,6 +646,7 @@ function findLastSdkAssistantInfo(
 	for (let i = messages.length - 1; i >= 0; i -= 1) {
 		const message = messages[i];
 		if (message?.role !== "assistant") continue;
+		if (isErroredAssistantMessage(message)) continue;
 		const timestamp = message.timestamp;
 		const uuid = state.uuidByAssistantTimestamp.get(timestamp);
 		if (uuid) {
@@ -633,6 +770,16 @@ function createEmptySdkState(): SdkSessionState {
 	};
 }
 
+function cloneSdkState(state: SdkSessionState): SdkSessionState {
+	return {
+		sdkSessionId: state.sdkSessionId,
+		uuidByAssistantTimestamp: new Map(state.uuidByAssistantTimestamp),
+		maxTimestamp: state.maxTimestamp,
+		pendingToolUseTimestamp: state.pendingToolUseTimestamp,
+		pendingToolUseIds: state.pendingToolUseIds ? [...state.pendingToolUseIds] : undefined,
+	};
+}
+
 function buildSdkStateFromEntries(entries: Array<Record<string, any>>): SdkSessionState {
 	const state = createEmptySdkState();
 	for (const entry of entries) {
@@ -739,9 +886,20 @@ function getSessionState(sessionKey: string): SessionSdkState | undefined {
 	return sdkStateBySessionKey.get(sessionKey);
 }
 
-function refreshSessionState(ctx: { sessionManager: { getSessionId: () => string; getEntries: () => any[]; getBranch: () => any[] } }): void {
+function refreshSessionState(ctx: {
+	sessionManager: {
+		getSessionId: () => string;
+		getEntries: () => any[];
+		getBranch: () => any[];
+		getSessionFile?: () => string | undefined;
+	};
+}): void {
 	const sessionKey = getSessionKeyFromManager(ctx.sessionManager);
 	rebuildSessionState(sessionKey, ctx.sessionManager.getEntries(), ctx.sessionManager.getBranch());
+	const sessionFile = ctx.sessionManager.getSessionFile?.();
+	if (typeof sessionFile === "string" && sessionFile.trim().length > 0) {
+		piSessionFileBySessionKey.set(sessionKey, sessionFile);
+	}
 }
 
 function getSdkSessionFilePath(sessionId: string, cwd: string): string {
@@ -781,6 +939,125 @@ function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
 		// ignore parse/read failures
 	}
 	return ids;
+}
+
+function getPiSessionFilePath(sessionId: string, cwd: string): string | undefined {
+	const cacheKey = `${cwd}\u0000${sessionId}`;
+	const cachedPath = piSessionFilePathCache.get(cacheKey);
+	if (cachedPath && existsSync(cachedPath)) {
+		return cachedPath;
+	}
+
+	const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+	const sessionDir = join(homedir(), ".pi", "agent", "sessions", safePath);
+	if (!existsSync(sessionDir)) return undefined;
+
+	const suffix = `_${sessionId}.jsonl`;
+	const candidates = readdirSync(sessionDir)
+		.filter((file) => file.endsWith(suffix))
+		.map((file) => join(sessionDir, file));
+	if (!candidates.length) return undefined;
+
+	candidates.sort((a, b) => {
+		try {
+			return statSync(b).mtimeMs - statSync(a).mtimeMs;
+		} catch {
+			return 0;
+		}
+	});
+
+	const latestPath = candidates[0];
+	if (latestPath) {
+		piSessionFilePathCache.set(cacheKey, latestPath);
+	}
+	return latestPath;
+}
+
+function getAllSdkStateFromPiSession(sessionKey: string, sessionId: string, cwd: string): SdkSessionState | undefined {
+	const knownSessionFilePath = piSessionFileBySessionKey.get(sessionKey);
+	const sessionFilePath =
+		typeof knownSessionFilePath === "string" && knownSessionFilePath.trim().length > 0 && existsSync(knownSessionFilePath)
+			? knownSessionFilePath
+			: getPiSessionFilePath(sessionId, cwd);
+	if (!sessionFilePath || !existsSync(sessionFilePath)) return undefined;
+
+	const cacheKey = sessionFilePath;
+
+	let stats: { mtimeMs: number; size: number } | undefined;
+	try {
+		const stat = statSync(sessionFilePath);
+		stats = { mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch {
+		return undefined;
+	}
+
+	const cached = piSessionSdkStateCache.get(cacheKey);
+	if (
+		cached &&
+		cached.sessionFilePath === sessionFilePath &&
+		cached.mtimeMs === stats.mtimeMs &&
+		cached.size === stats.size
+	) {
+		return cloneSdkState(cached.state);
+	}
+
+	const sdkEntries: Array<Record<string, any>> = [];
+	try {
+		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			if (!line.includes('"customType"')) continue;
+			if (!line.includes(SDK_SESSION_CUSTOM_TYPE)) continue;
+			try {
+				sdkEntries.push(JSON.parse(line) as Record<string, any>);
+			} catch {
+				// ignore malformed lines
+			}
+		}
+	} catch {
+		return undefined;
+	}
+
+	const state = buildSdkStateFromEntries(sdkEntries);
+	piSessionSdkStateCache.set(cacheKey, {
+		sessionFilePath,
+		mtimeMs: stats.mtimeMs,
+		size: stats.size,
+		state,
+	});
+	return cloneSdkState(state);
+}
+
+function syncAllSdkStateFromPiSession(sessionKey: string, sessionId: string, cwd: string): void {
+	const diskAllState = getAllSdkStateFromPiSession(sessionKey, sessionId, cwd);
+	if (!diskAllState) return;
+
+	const current = getSessionState(sessionKey);
+	if (!current) {
+		sdkStateBySessionKey.set(sessionKey, {
+			branch: cloneSdkState(diskAllState),
+			all: cloneSdkState(diskAllState),
+		});
+		return;
+	}
+
+	current.all = diskAllState;
+	if (!current.branch.sdkSessionId && diskAllState.sdkSessionId) {
+		current.branch.sdkSessionId = diskAllState.sdkSessionId;
+	}
+	sdkStateBySessionKey.set(sessionKey, current);
+}
+
+function setKnownPiSessionFileForSessionKey(sessionKey: string, sessionFilePath: string): void {
+	if (!sessionKey || !sessionFilePath) return;
+	piSessionFileBySessionKey.set(sessionKey, sessionFilePath);
+}
+
+function clearInternalStateForTests(): void {
+	sdkStateBySessionKey.clear();
+	piSessionSdkStateCache.clear();
+	piSessionFilePathCache.clear();
+	piSessionFileBySessionKey.clear();
 }
 
 function rewriteSkillsLocations(skillsBlock: string): string {
@@ -1047,6 +1324,28 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 	}
 }
 
+function hasToolInputArgs(input: Record<string, unknown> | undefined): boolean {
+	if (!input || typeof input !== "object") return false;
+	return Object.keys(input).length > 0;
+}
+
+function sanitizeAssistantContentForEmit(output: AssistantMessage): void {
+	if (!Array.isArray(output.content) || output.content.length === 0) return;
+	const sanitized = output.content.filter((block) => {
+		if (block.type !== "toolCall") return true;
+		if ("index" in (block as any)) return false;
+		if ("partialJson" in (block as any)) return false;
+		return true;
+	});
+	(output.content as any) = sanitized;
+	if (output.stopReason === "toolUse") {
+		const hasToolCall = sanitized.some((block) => block.type === "toolCall");
+		if (!hasToolCall) {
+			output.stopReason = "stop";
+		}
+	}
+}
+
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -1115,12 +1414,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let shouldStopEarly = false;
 		let abortedForToolCall = false;
 		const pendingToolUseIds = new Set<string>();
+		const announcedToolCallIndices = new Set<number>();
+		const emittedToolCallDeltaIndices = new Set<number>();
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
 
 			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+			const piSessionId = (options as { sessionId?: string } | undefined)?.sessionId;
 			const sessionKey = buildSessionKey(options, cwd);
+			if (sessionKey && typeof piSessionId === "string" && piSessionId.trim().length > 0) {
+				syncAllSdkStateFromPiSession(sessionKey, piSessionId.trim(), cwd);
+			}
 			const sessionState = sessionKey ? getSessionState(sessionKey) : undefined;
 			const branchState = sessionState?.branch;
 			const allState = sessionState?.all;
@@ -1129,7 +1434,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			let resumeSessionId: string | undefined;
 			let resumeSessionAt: string | undefined;
 			let forkSession: boolean | undefined;
-			let prompt: AsyncIterable<SDKUserMessage> | string;
+			let prompt: AsyncIterable<SDKUserMessage> | string | undefined;
+			let resumeTailMessages: Context["messages"] | undefined;
+			let resumeTailAllowedToolUseIds: Set<string> | undefined;
 
 			if (!branchState?.sdkSessionId) {
 				prompt = buildPromptStream(buildPromptBlocks(context, customToolNameToSdk));
@@ -1139,24 +1446,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					prompt = buildPromptStream(buildPromptBlocks(context, customToolNameToSdk));
 				} else {
 					resumeSessionId = branchState.sdkSessionId;
-					const tailMessages = context.messages.slice(lastSdkInfo.index + 1);
-					const tailHasAssistant = tailMessages.some((message) => message.role === "assistant");
-					let tailAllowedToolUseIds = !tailHasAssistant ? collectToolResultIds(tailMessages) : undefined;
-					if (tailHasAssistant) {
-						let lastUserIndex = -1;
-						for (let i = tailMessages.length - 1; i >= 0; i -= 1) {
-							if (tailMessages[i]?.role === "user") {
-								lastUserIndex = i;
-								break;
-							}
-						}
-						const summaryMessages = lastUserIndex >= 0 ? tailMessages.slice(0, lastUserIndex) : tailMessages;
-						const summaryText = buildHistoricalSummary(summaryMessages, customToolNameToSdk);
-						const userMessage =
-							lastUserIndex >= 0
-								? (tailMessages[lastUserIndex] as Extract<Context["messages"][number], { role: "user" }>)
-								: undefined;
-						prompt = buildPromptWithSummary(summaryText, userMessage, supportsImages);
+					resumeSessionAt = lastSdkInfo.uuid;
+					resumeTailMessages = context.messages.slice(lastSdkInfo.index + 1);
+					const tailPlan = analyzeResumeTailMessages(resumeTailMessages, branchState.pendingToolUseTimestamp);
+					let tailAllowedToolUseIds = tailPlan.tailAllowedToolUseIds;
+					if (tailPlan.shouldUseSummaryPrompt) {
+						const summaryText = buildHistoricalSummary(tailPlan.summaryMessages, customToolNameToSdk);
+						prompt = buildPromptWithSummary(summaryText, tailPlan.userMessage, supportsImages);
 					} else if (resumeSessionId) {
 						const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
 						if (existingToolResultIds.size > 0 && tailAllowedToolUseIds) {
@@ -1166,22 +1462,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						}
 					}
 
-					if (
-						branchState.maxTimestamp != null &&
-						allState?.maxTimestamp != null &&
-						branchState.maxTimestamp < allState.maxTimestamp
-					) {
-						resumeSessionAt = branchState.uuidByAssistantTimestamp.get(branchState.maxTimestamp);
-						forkSession = Boolean(resumeSessionAt);
+					const forkPlan = computeResumeForkPlan(branchState, allState);
+					if (forkPlan.resumeSessionAt) {
+						resumeSessionAt = forkPlan.resumeSessionAt;
+					}
+					if (forkPlan.forkSession !== undefined) {
+						forkSession = forkPlan.forkSession;
 					}
 					if (branchState.pendingToolUseTimestamp != null) {
-						const pendingUuid = branchState.uuidByAssistantTimestamp.get(
-							branchState.pendingToolUseTimestamp,
-						);
-						if (pendingUuid) {
-							resumeSessionAt = pendingUuid;
-							forkSession = true;
-						}
 						if (branchState.pendingToolUseIds?.length) {
 							const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds);
 							if (!tailAllowedToolUseIds) {
@@ -1192,19 +1480,32 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								);
 							}
 						}
-						if (!tailHasAssistant) {
-							prompt = buildResumePromptFromTail(tailMessages, supportsImages, tailAllowedToolUseIds);
+						if (!tailPlan.tailHasAssistant) {
+							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
 						}
 						persistSdkEntry(sessionKey, {
 							providerId: PROVIDER_ID,
 							pendingToolUseTimestamp: null,
 							pendingToolUseIds: null,
 						});
-					} else if (!tailHasAssistant) {
-						prompt = buildResumePromptFromTail(tailMessages, supportsImages, tailAllowedToolUseIds);
+					} else if (!tailPlan.tailHasAssistant) {
+						prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
 					}
+					resumeTailAllowedToolUseIds = tailAllowedToolUseIds;
 				}
 
+			}
+
+			if (prompt === undefined) {
+				if (hasReplayableTailMessages(resumeTailMessages)) {
+					prompt = buildResumePromptFromTail(
+						resumeTailMessages,
+						supportsImages,
+						resumeTailAllowedToolUseIds,
+					);
+				} else {
+					prompt = "Continue.";
+				}
 			}
 
 			const useResume = Boolean(resumeSessionId);
@@ -1331,17 +1632,28 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								output.content.push(block);
 								stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 							} else if (event.content_block?.type === "tool_use") {
-								sawToolCall = true;
+								const inputArgs = (event.content_block.input as Record<string, unknown>) ?? {};
 								const block = {
 									type: "toolCall",
 									id: event.content_block.id,
 									name: mapToolName(event.content_block.name, customToolNameToPi),
-									arguments: (event.content_block.input as Record<string, unknown>) ?? {},
+									arguments: inputArgs,
 									partialJson: "",
 									index: event.index,
 								} as const;
 								output.content.push(block);
-								stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+								if (hasToolInputArgs(inputArgs)) {
+									const contentIndex = output.content.length - 1;
+									announcedToolCallIndices.add(event.index);
+									emittedToolCallDeltaIndices.add(event.index);
+									stream.push({ type: "toolcall_start", contentIndex, partial: output });
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex,
+										delta: JSON.stringify(inputArgs),
+										partial: output,
+									});
+								}
 							}
 							break;
 						}
@@ -1377,12 +1689,20 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								if (block?.type === "toolCall") {
 									block.partialJson += event.delta.partial_json;
 									block.arguments = parsePartialJson(block.partialJson, block.arguments);
-									stream.push({
-										type: "toolcall_delta",
-										contentIndex: index,
-										delta: event.delta.partial_json,
-										partial: output,
-									});
+									const hasArgs = hasToolInputArgs(block.arguments as Record<string, unknown>);
+									if (hasArgs && !announcedToolCallIndices.has(event.index)) {
+										announcedToolCallIndices.add(event.index);
+										stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+									}
+									if (hasArgs && !emittedToolCallDeltaIndices.has(event.index)) {
+										emittedToolCallDeltaIndices.add(event.index);
+										stream.push({
+											type: "toolcall_delta",
+											contentIndex: index,
+											delta: JSON.stringify(block.arguments),
+											partial: output,
+										});
+									}
 								}
 							} else if (event.delta?.type === "signature_delta") {
 								const index = blocks.findIndex((block) => block.index === event.index);
@@ -1414,12 +1734,26 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									partial: output,
 								});
 							} else if (block.type === "toolCall") {
-								sawToolCall = true;
 								block.arguments = mapToolArgs(
 									block.name,
 									parsePartialJson(block.partialJson, block.arguments),
 									allowSkillAliasRewrite,
 								);
+								const hasArgs = hasToolInputArgs(block.arguments as Record<string, unknown>);
+								if (hasArgs && !announcedToolCallIndices.has(event.index)) {
+									announcedToolCallIndices.add(event.index);
+									stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+								}
+								if (hasArgs && !emittedToolCallDeltaIndices.has(event.index)) {
+									emittedToolCallDeltaIndices.add(event.index);
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex: index,
+										delta: JSON.stringify(block.arguments),
+										partial: output,
+									});
+								}
+								sawToolCall = true;
 								delete (block as any).partialJson;
 								pendingToolUseIds.add(block.id);
 								stream.push({
@@ -1428,6 +1762,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									toolCall: block,
 									partial: output,
 								});
+								announcedToolCallIndices.delete(event.index);
+								emittedToolCallDeltaIndices.delete(event.index);
 							}
 							break;
 						}
@@ -1443,16 +1779,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							output.usage.totalTokens =
 								output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 							calculateCost(model, output.usage);
-							if (stopReason === "toolUse" && sawToolCall && !abortedForToolCall) {
-								abortedForToolCall = true;
-								shouldStopEarly = true;
-								persistSdkEntry(sessionKey, {
-									providerId: PROVIDER_ID,
-									pendingToolUseTimestamp: output.timestamp,
-									pendingToolUseIds: Array.from(pendingToolUseIds),
-								});
-								requestClose();
-							}
 							break;
 						}
 
@@ -1487,6 +1813,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				}
 			}
 
+			if (output.stopReason === "toolUse" && sawToolCall && !abortedForToolCall) {
+				abortedForToolCall = true;
+				persistSdkEntry(sessionKey, {
+					providerId: PROVIDER_ID,
+					pendingToolUseTimestamp: output.timestamp,
+					pendingToolUseIds: Array.from(pendingToolUseIds),
+				});
+			}
+
+			sanitizeAssistantContentForEmit(output);
+
 			if (wasAborted || options?.signal?.aborted) {
 				output.stopReason = "aborted";
 				output.errorMessage = "Operation aborted";
@@ -1502,6 +1839,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 			stream.end();
 		} catch (error) {
+			sanitizeAssistantContentForEmit(output);
 			const aborted = Boolean(wasAborted || options?.signal?.aborted);
 			output.stopReason = aborted ? "aborted" : "error";
 			output.errorMessage = aborted ? "Operation aborted" : error instanceof Error ? error.message : String(error);
@@ -1545,3 +1883,20 @@ export default function (pi: ExtensionAPI) {
 		streamSimple: streamClaudeAgentSdk,
 	});
 }
+
+export const __test = {
+	analyzeResumeTailMessages,
+	computeResumeForkPlan,
+	buildHistoricalSummary,
+	buildPromptWithSummary,
+	buildSdkStateFromEntries,
+	syncAllSdkStateFromPiSession,
+	getSessionState,
+	setKnownPiSessionFileForSessionKey,
+	clearInternalStateForTests,
+	buildResumePromptFromTail,
+	hasReplayableTailMessages,
+	findLastSdkAssistantInfo,
+	isErroredAssistantMessage,
+	sanitizeAssistantContentForEmit,
+};
