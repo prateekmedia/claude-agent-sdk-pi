@@ -248,6 +248,15 @@ test("sanitizeAssistantContentForEmit drops incomplete tool calls", () => {
 	__test.sanitizeAssistantContentForEmit(onlyPartial);
 	assert.equal(onlyPartial.content.length, 0);
 	assert.equal(onlyPartial.stopReason, "stop");
+
+	const finalizedButEmptyArgs: any = {
+		role: "assistant",
+		content: [{ type: "toolCall", id: "toolu_empty", name: "write", arguments: {} }],
+		stopReason: "toolUse",
+	};
+	__test.sanitizeAssistantContentForEmit(finalizedButEmptyArgs);
+	assert.equal(finalizedButEmptyArgs.content.length, 0);
+	assert.equal(finalizedButEmptyArgs.stopReason, "stop");
 });
 
 test("isIgnorableTransportWriteAfterCloseError matches process transport write-close race", () => {

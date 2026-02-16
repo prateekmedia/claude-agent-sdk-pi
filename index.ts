@@ -1335,6 +1335,7 @@ function sanitizeAssistantContentForEmit(output: AssistantMessage): void {
 		if (block.type !== "toolCall") return true;
 		if ("index" in (block as any)) return false;
 		if ("partialJson" in (block as any)) return false;
+		if (!hasToolInputArgs((block as any).arguments)) return false;
 		return true;
 	});
 	(output.content as any) = sanitized;
@@ -1416,6 +1417,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let started = false;
 		let sawStreamEvent = false;
 		let sawToolCall = false;
+		let shouldStopEarly = false;
 		let abortedForToolCall = false;
 		const pendingToolUseIds = new Set<string>();
 		const announcedToolCallIndices = new Set<number>();
@@ -1765,11 +1767,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									allowSkillAliasRewrite,
 								);
 								const hasArgs = hasToolInputArgs(block.arguments as Record<string, unknown>);
-								if (hasArgs && !announcedToolCallIndices.has(event.index)) {
+								if (!hasArgs) {
+									delete (block as any).partialJson;
+									delete (block as any).index;
+									(output.content as any).splice(index, 1);
+									announcedToolCallIndices.delete(event.index);
+									emittedToolCallDeltaIndices.delete(event.index);
+									break;
+								}
+								if (!announcedToolCallIndices.has(event.index)) {
 									announcedToolCallIndices.add(event.index);
 									stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
 								}
-								if (hasArgs && !emittedToolCallDeltaIndices.has(event.index)) {
+								if (!emittedToolCallDeltaIndices.has(event.index)) {
 									emittedToolCallDeltaIndices.add(event.index);
 									stream.push({
 										type: "toolcall_delta",
@@ -1809,6 +1819,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 						if (event?.type === "message_stop" && sawToolCall) {
 							output.stopReason = "toolUse";
+							shouldStopEarly = true;
 							if (!abortedForToolCall) {
 								abortedForToolCall = true;
 								persistSdkEntry(sessionKey, {
@@ -1831,6 +1842,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					}
 				}
 
+				if (shouldStopEarly) {
+					break;
+				}
 			}
 
 			if (output.stopReason === "toolUse" && sawToolCall && !abortedForToolCall) {
