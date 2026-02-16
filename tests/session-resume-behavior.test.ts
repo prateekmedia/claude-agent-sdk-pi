@@ -250,6 +250,15 @@ test("sanitizeAssistantContentForEmit drops incomplete tool calls", () => {
 	assert.equal(onlyPartial.stopReason, "stop");
 });
 
+test("isIgnorableTransportWriteAfterCloseError matches process transport write-close race", () => {
+	assert.equal(
+		__test.isIgnorableTransportWriteAfterCloseError(new Error("ProcessTransport is not ready for writing")),
+		true,
+	);
+	assert.equal(__test.isIgnorableTransportWriteAfterCloseError(new Error("random failure")), false);
+	assert.equal(__test.isIgnorableTransportWriteAfterCloseError("ProcessTransport is not ready for writing"), false);
+});
+
 test("findLastSdkAssistantInfo skips errored assistant anchors", () => {
 	ts = 1;
 	const okAssistant = assistant("all good") as Extract<Context["messages"][number], { role: "assistant" }>;

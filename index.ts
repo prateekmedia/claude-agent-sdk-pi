@@ -1346,6 +1346,11 @@ function sanitizeAssistantContentForEmit(output: AssistantMessage): void {
 	}
 }
 
+function isIgnorableTransportWriteAfterCloseError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.includes("ProcessTransport is not ready for writing");
+}
+
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -1411,7 +1416,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let started = false;
 		let sawStreamEvent = false;
 		let sawToolCall = false;
-		let shouldStopEarly = false;
 		let abortedForToolCall = false;
 		const pendingToolUseIds = new Set<string>();
 		const announcedToolCallIndices = new Set<number>();
@@ -1784,7 +1788,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 						if (event?.type === "message_stop" && sawToolCall) {
 							output.stopReason = "toolUse";
-							shouldStopEarly = true;
 							if (!abortedForToolCall) {
 								abortedForToolCall = true;
 								persistSdkEntry(sessionKey, {
@@ -1792,7 +1795,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									pendingToolUseTimestamp: output.timestamp,
 									pendingToolUseIds: Array.from(pendingToolUseIds),
 								});
-								requestClose();
 							}
 							break;
 						}
@@ -1808,9 +1810,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					}
 				}
 
-				if (shouldStopEarly) {
-					break;
-				}
 			}
 
 			if (output.stopReason === "toolUse" && sawToolCall && !abortedForToolCall) {
@@ -1840,6 +1839,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			stream.end();
 		} catch (error) {
 			sanitizeAssistantContentForEmit(output);
+			if (output.stopReason === "toolUse" && isIgnorableTransportWriteAfterCloseError(error)) {
+				stream.push({
+					type: "done",
+					reason: "toolUse",
+					message: output,
+				});
+				stream.end();
+				return;
+			}
 			const aborted = Boolean(wasAborted || options?.signal?.aborted);
 			output.stopReason = aborted ? "aborted" : "error";
 			output.errorMessage = aborted ? "Operation aborted" : error instanceof Error ? error.message : String(error);
@@ -1899,4 +1907,5 @@ export const __test = {
 	findLastSdkAssistantInfo,
 	isErroredAssistantMessage,
 	sanitizeAssistantContentForEmit,
+	isIgnorableTransportWriteAfterCloseError,
 };
