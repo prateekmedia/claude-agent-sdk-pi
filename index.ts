@@ -473,7 +473,11 @@ function analyzeResumeTailMessages(
 			: undefined;
 	const shouldReplayPendingToolResults = pendingToolUseTimestamp != null && !tailHasAssistant;
 	const shouldUseSummaryPrompt = summaryMessages.length > 0 && !shouldReplayPendingToolResults;
-	const tailAllowedToolUseIds = !shouldUseSummaryPrompt ? collectToolResultIds(tailMessages) : undefined;
+	const tailAllowedToolUseIds = shouldUseSummaryPrompt
+		? undefined
+		: shouldReplayPendingToolResults
+			? collectToolResultIds(tailMessages)
+			: new Set<string>();
 
 	return {
 		tailHasAssistant,
@@ -536,6 +540,15 @@ function buildResumePromptFromTail(
 ): AsyncIterable<SDKUserMessage> | string {
 	if (!tailMessages.length) return "";
 
+	const latestAllowedToolResultIndexById = new Map<string, number>();
+	for (let i = 0; i < tailMessages.length; i += 1) {
+		const message = tailMessages[i];
+		if (message?.role !== "toolResult") continue;
+		const toolMessage = message as Extract<Context["messages"][number], { role: "toolResult" }>;
+		if (allowedToolUseIds && !allowedToolUseIds.has(toolMessage.toolCallId)) continue;
+		latestAllowedToolResultIndexById.set(toolMessage.toolCallId, i);
+	}
+
 	async function* generator() {
 		let index = 0;
 		while (index < tailMessages.length) {
@@ -572,7 +585,9 @@ function buildResumePromptFromTail(
 						Context["messages"][number],
 						{ role: "toolResult" }
 					>;
-					const shouldInclude = !allowedToolUseIds || allowedToolUseIds.has(toolMessage.toolCallId);
+					const isAllowedId = !allowedToolUseIds || allowedToolUseIds.has(toolMessage.toolCallId);
+					const isLatestAllowed = latestAllowedToolResultIndexById.get(toolMessage.toolCallId) === index;
+					const shouldInclude = isAllowedId && isLatestAllowed;
 					if (shouldInclude) {
 						const content = convertPiContentToBlocks(toolMessage.content, supportsImages);
 						const normalizedContent = normalizeToolResultContent(
@@ -592,7 +607,7 @@ function buildResumePromptFromTail(
 						} else {
 							toolResults[existingIndex] = toolResult;
 						}
-					} else {
+					} else if (!isAllowedId) {
 						const plain = contentToPlainText(toolMessage.content).trim();
 						skippedSummaries.push(
 							`TOOL RESULT (already recorded ${toolMessage.toolName}, id=${toolMessage.toolCallId}): ${plain || (toolMessage.isError ? "(tool error with no output)" : "(no output)")}`,
@@ -1489,8 +1504,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						forkSession = forkPlan.forkSession;
 					}
 					if (branchState.pendingToolUseTimestamp != null) {
-						if (branchState.pendingToolUseIds?.length) {
-							const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds);
+						const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
+						const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
+						const canReplayStructuredToolResults =
+							Boolean(pendingUuid) &&
+							resumeSessionAt === pendingUuid &&
+							pendingToolUseIdSet.size > 0;
+						if (canReplayStructuredToolResults) {
 							if (!tailAllowedToolUseIds) {
 								tailAllowedToolUseIds = pendingToolUseIdSet;
 							} else {
@@ -1498,6 +1518,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									[...tailAllowedToolUseIds].filter((id) => pendingToolUseIdSet.has(id)),
 								);
 							}
+						} else {
+							// Avoid emitting raw tool_result blocks without guaranteed matching tool_use context.
+							// Fallback to textual replay summaries instead.
+							tailAllowedToolUseIds = new Set<string>();
 						}
 						if (!tailPlan.tailHasAssistant) {
 							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
@@ -1520,7 +1544,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					prompt = buildResumePromptFromTail(
 						resumeTailMessages,
 						supportsImages,
-						resumeTailAllowedToolUseIds,
+						resumeTailAllowedToolUseIds ?? new Set<string>(),
 					);
 				} else {
 					prompt = "Continue.";

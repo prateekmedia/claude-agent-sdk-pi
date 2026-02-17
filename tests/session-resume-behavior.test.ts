@@ -134,6 +134,29 @@ test("single-session interrupted tool flow replays user + tool_result via resume
 	assert.equal(__test.hasReplayableTailMessages([assistant("tool call")]), false);
 });
 
+test("resume tail dedupes repeated tool_result ids across separated segments", async () => {
+	const tail: Context["messages"] = [
+		toolResult("toolu_dup", "first result"),
+		user("note"),
+		toolResult("toolu_dup", "second result"),
+		user("continue"),
+	];
+	const prompt = __test.buildResumePromptFromTail(tail, true, new Set(["toolu_dup"]));
+	const messages = await collectPromptMessages(prompt);
+	const seenToolResultIds: string[] = [];
+	for (const message of messages) {
+		if (message.type !== "user") continue;
+		const content = (message.message as { content?: unknown })?.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content as Array<{ type?: string; tool_use_id?: string }>) {
+			if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
+				seenToolResultIds.push(block.tool_use_id);
+			}
+		}
+	}
+	assert.deepEqual(seenToolResultIds, ["toolu_dup"]);
+});
+
 test("pending tool-use continuation -> replay tool results, do not summarize", () => {
 	const tail: Context["messages"] = [toolResult("toolu_123", "ok"), user("continue")];
 	const plan = __test.analyzeResumeTailMessages(tail, 123456);
