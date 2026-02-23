@@ -248,6 +248,46 @@ test("buildSdkStateFromEntries ignores non-provider entries and tracks latest sd
 	assert.equal(state.uuidByAssistantTimestamp.get(222), "uuid-222");
 });
 
+test("normalizeClaudeProjectDirName matches Claude project directory naming for dotted paths", () => {
+	assert.equal(
+		__test.normalizeClaudeProjectDirName("/Volumes/MYBACKUPS/clie/Datsme-3.0"),
+		"-Volumes-MYBACKUPS-clie-Datsme-3-0",
+	);
+});
+
+test("collectRecordedToolResultIdsFromNodes includes anchor ancestors + descendants", () => {
+	const nodes = new Map<string, { parentUuid?: string; toolResultIds: string[]; toolUseIds: string[] }>([
+		["root", { parentUuid: undefined, toolResultIds: ["toolu_root"], toolUseIds: [] }],
+		["anchor", { parentUuid: "root", toolResultIds: [], toolUseIds: [] }],
+		["desc-1", { parentUuid: "anchor", toolResultIds: ["toolu_keep_1"], toolUseIds: [] }],
+		["desc-2", { parentUuid: "desc-1", toolResultIds: ["toolu_keep_2"], toolUseIds: [] }],
+		["side-1", { parentUuid: "root", toolResultIds: ["toolu_skip"], toolUseIds: [] }],
+	]);
+
+	const anchored = __test.collectRecordedToolResultIdsFromNodes(nodes, "anchor");
+	assert.deepEqual([...anchored].sort(), ["toolu_keep_1", "toolu_keep_2", "toolu_root"]);
+
+	const unanchored = __test.collectRecordedToolResultIdsFromNodes(nodes);
+	assert.deepEqual([...unanchored].sort(), ["toolu_keep_1", "toolu_keep_2", "toolu_root", "toolu_skip"]);
+});
+
+test("collectUnresolvedToolUseIdsOnAnchorPath keeps only unresolved ids on anchor path", () => {
+	const nodes = new Map<string, { parentUuid?: string; toolResultIds: string[]; toolUseIds: string[] }>([
+		["root", { parentUuid: undefined, toolResultIds: [], toolUseIds: [] }],
+		["a", { parentUuid: "root", toolResultIds: [], toolUseIds: ["toolu_1"] }],
+		["b", { parentUuid: "a", toolResultIds: ["toolu_1"], toolUseIds: [] }],
+		["anchor", { parentUuid: "b", toolResultIds: [], toolUseIds: ["toolu_2"] }],
+		["side", { parentUuid: "a", toolResultIds: [], toolUseIds: ["toolu_3"] }],
+	]);
+
+	const unresolved = __test.collectUnresolvedToolUseIdsOnAnchorPath(
+		nodes,
+		"anchor",
+		new Set(["toolu_1", "toolu_2", "toolu_3"]),
+	);
+	assert.deepEqual([...unresolved].sort(), ["toolu_2"]);
+});
+
 test("sanitizeAssistantContentForEmit drops incomplete tool calls", () => {
 	const output: any = {
 		role: "assistant",

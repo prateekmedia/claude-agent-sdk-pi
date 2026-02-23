@@ -917,43 +917,209 @@ function refreshSessionState(ctx: {
 	}
 }
 
-function getSdkSessionFilePath(sessionId: string, cwd: string): string {
-	let projectDir = cwd.replace(/[\\/]+/g, "-");
+function normalizeClaudeProjectDirName(cwd: string): string {
+	let projectDir = cwd.replace(/[\\/:.]+/g, "-");
 	if (!projectDir.startsWith("-")) projectDir = `-${projectDir}`;
-	return join(homedir(), ".claude", "projects", projectDir, `${sessionId}.jsonl`);
+	return projectDir;
 }
 
-function getExistingToolResultIds(sessionId: string, cwd: string): Set<string> {
-	const ids = new Set<string>();
+function getClaudeProjectDir(cwd: string): string {
+	return join(homedir(), ".claude", "projects", normalizeClaudeProjectDirName(cwd));
+}
+
+function getSdkSessionFilePath(sessionId: string, cwd: string): string {
+	return join(getClaudeProjectDir(cwd), `${sessionId}.jsonl`);
+}
+
+type ClaudeSessionNode = {
+	parentUuid?: string;
+	toolResultIds: string[];
+	toolUseIds: string[];
+};
+
+function extractToolResultIdsFromClaudeContent(content: unknown): string[] {
+	if (!Array.isArray(content)) return [];
+	const ids: string[] = [];
+	for (const block of content) {
+		if (
+			typeof block === "object" &&
+			block != null &&
+			(block as { type?: unknown }).type === "tool_result" &&
+			typeof (block as { tool_use_id?: unknown }).tool_use_id === "string" &&
+			(block as { tool_use_id: string }).tool_use_id.trim().length > 0
+		) {
+			ids.push((block as { tool_use_id: string }).tool_use_id);
+		}
+	}
+	return ids;
+}
+
+function extractToolUseIdsFromClaudeContent(content: unknown): string[] {
+	if (!Array.isArray(content)) return [];
+	const ids: string[] = [];
+	for (const block of content) {
+		if (
+			typeof block === "object" &&
+			block != null &&
+			(block as { type?: unknown }).type === "tool_use" &&
+			typeof (block as { id?: unknown }).id === "string" &&
+			(block as { id: string }).id.trim().length > 0
+		) {
+			ids.push((block as { id: string }).id);
+		}
+	}
+	return ids;
+}
+
+function collectClaudeSessionNodesFromFile(sessionFilePath: string, nodes: Map<string, ClaudeSessionNode>): void {
+	if (!existsSync(sessionFilePath)) return;
+	let lines: string[];
 	try {
-		const sessionFilePath = getSdkSessionFilePath(sessionId, cwd);
-		if (!existsSync(sessionFilePath)) return ids;
-		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			let parsed: any;
-			try {
-				parsed = JSON.parse(line);
-			} catch {
-				continue;
+		lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+	} catch {
+		return;
+	}
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let parsed: any;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const uuid = typeof parsed?.uuid === "string" ? parsed.uuid : undefined;
+		if (!uuid) continue;
+		const parentUuid = typeof parsed?.parentUuid === "string" ? parsed.parentUuid : undefined;
+		const content = parsed?.message?.content;
+		const toolResultIds = parsed?.type === "user" ? extractToolResultIdsFromClaudeContent(content) : [];
+		const toolUseIds = parsed?.type === "assistant" ? extractToolUseIdsFromClaudeContent(content) : [];
+		const existing = nodes.get(uuid);
+		nodes.set(uuid, {
+			parentUuid: existing?.parentUuid ?? parentUuid,
+			toolResultIds: existing?.toolResultIds?.length ? existing.toolResultIds : toolResultIds,
+			toolUseIds: existing?.toolUseIds?.length ? existing.toolUseIds : toolUseIds,
+		});
+	}
+}
+
+function getPathToRootUuids(nodes: Map<string, ClaudeSessionNode>, anchorUuid: string): string[] {
+	const path: string[] = [];
+	const seen = new Set<string>();
+	let current: string | undefined = anchorUuid;
+	while (current && !seen.has(current)) {
+		path.push(current);
+		seen.add(current);
+		current = nodes.get(current)?.parentUuid;
+	}
+	path.reverse();
+	return path;
+}
+
+function isDescendantOfAnchor(nodes: Map<string, ClaudeSessionNode>, anchorUuid: string, uuid: string): boolean {
+	const seen = new Set<string>();
+	let current: string | undefined = uuid;
+	while (current && !seen.has(current)) {
+		if (current === anchorUuid) return true;
+		seen.add(current);
+		current = nodes.get(current)?.parentUuid;
+	}
+	return false;
+}
+
+function collectRecordedToolResultIdsFromNodes(nodes: Map<string, ClaudeSessionNode>, resumeAnchorUuid?: string): Set<string> {
+	const ids = new Set<string>();
+	const anchor = typeof resumeAnchorUuid === "string" && resumeAnchorUuid.trim().length > 0 ? resumeAnchorUuid : undefined;
+
+	if (!anchor) {
+		for (const node of nodes.values()) {
+			for (const id of node.toolResultIds) ids.add(id);
+		}
+		return ids;
+	}
+
+	for (const uuid of getPathToRootUuids(nodes, anchor)) {
+		const node = nodes.get(uuid);
+		if (!node) continue;
+		for (const id of node.toolResultIds) ids.add(id);
+	}
+
+	for (const [uuid, node] of nodes.entries()) {
+		if (node.toolResultIds.length === 0) continue;
+		if (!isDescendantOfAnchor(nodes, anchor, uuid)) continue;
+		for (const id of node.toolResultIds) ids.add(id);
+	}
+	return ids;
+}
+
+function collectUnresolvedToolUseIdsOnAnchorPath(
+	nodes: Map<string, ClaudeSessionNode>,
+	resumeAnchorUuid: string,
+	allowedIds?: Set<string>,
+): Set<string> {
+	const seenToolUseIds = new Set<string>();
+	const seenToolResultIds = new Set<string>();
+	for (const uuid of getPathToRootUuids(nodes, resumeAnchorUuid)) {
+		const node = nodes.get(uuid);
+		if (!node) continue;
+		for (const id of node.toolUseIds) {
+			if (!allowedIds || allowedIds.has(id)) {
+				seenToolUseIds.add(id);
 			}
-			if (parsed?.type !== "user") continue;
-			const content = parsed?.message?.content;
-			if (!Array.isArray(content)) continue;
-			for (const block of content) {
-				if (
-					block?.type === "tool_result" &&
-					typeof block?.tool_use_id === "string" &&
-					block.tool_use_id.trim().length > 0
-				) {
-					ids.add(block.tool_use_id);
+		}
+		for (const id of node.toolResultIds) {
+			if (!allowedIds || allowedIds.has(id)) {
+				seenToolResultIds.add(id);
+			}
+		}
+	}
+	return new Set([...seenToolUseIds].filter((id) => !seenToolResultIds.has(id)));
+}
+
+function collectClaudeSessionNodes(sessionId: string, cwd: string): Map<string, ClaudeSessionNode> {
+	const nodes = new Map<string, ClaudeSessionNode>();
+	try {
+		const currentSessionFilePath = getSdkSessionFilePath(sessionId, cwd);
+		collectClaudeSessionNodesFromFile(currentSessionFilePath, nodes);
+
+		const projectDir = getClaudeProjectDir(cwd);
+		if (!existsSync(projectDir)) return nodes;
+		const extraSessionFiles = readdirSync(projectDir)
+			.filter((file) => file.endsWith(".jsonl"))
+			.map((file) => join(projectDir, file))
+			.filter((filePath) => filePath !== currentSessionFilePath)
+			.sort((a, b) => {
+				try {
+					return statSync(b).mtimeMs - statSync(a).mtimeMs;
+				} catch {
+					return 0;
 				}
-			}
+			})
+			.slice(0, 24);
+		for (const filePath of extraSessionFiles) {
+			collectClaudeSessionNodesFromFile(filePath, nodes);
 		}
 	} catch {
 		// ignore parse/read failures
 	}
-	return ids;
+	return nodes;
+}
+
+function getExistingToolResultIds(sessionId: string, cwd: string, resumeAnchorUuid?: string): Set<string> {
+	const nodes = collectClaudeSessionNodes(sessionId, cwd);
+	return collectRecordedToolResultIdsFromNodes(nodes, resumeAnchorUuid);
+}
+
+function getReplayablePendingToolUseIds(
+	sessionId: string,
+	cwd: string,
+	resumeAnchorUuid: string,
+	pendingToolUseIds: Set<string>,
+): Set<string> {
+	if (pendingToolUseIds.size === 0) return new Set<string>();
+	const nodes = collectClaudeSessionNodes(sessionId, cwd);
+	const unresolvedIds = collectUnresolvedToolUseIdsOnAnchorPath(nodes, resumeAnchorUuid, pendingToolUseIds);
+	const existingResultIds = collectRecordedToolResultIdsFromNodes(nodes, resumeAnchorUuid);
+	return new Set([...unresolvedIds].filter((id) => !existingResultIds.has(id)));
 }
 
 function getPiSessionFilePath(sessionId: string, cwd: string): string | undefined {
@@ -1487,13 +1653,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					if (tailPlan.shouldUseSummaryPrompt) {
 						const summaryText = buildHistoricalSummary(tailPlan.summaryMessages, customToolNameToSdk);
 						prompt = buildPromptWithSummary(summaryText, tailPlan.userMessage, supportsImages);
-					} else if (resumeSessionId) {
-						const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd);
-						if (existingToolResultIds.size > 0 && tailAllowedToolUseIds) {
-							tailAllowedToolUseIds = new Set(
-								[...tailAllowedToolUseIds].filter((id) => !existingToolResultIds.has(id)),
-							);
-						}
 					}
 
 					const forkPlan = computeResumeForkPlan(branchState, allState);
@@ -1505,7 +1664,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					}
 					if (branchState.pendingToolUseTimestamp != null) {
 						const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
-						const pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
+						let pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
+						if (resumeSessionId && pendingUuid && pendingToolUseIdSet.size > 0) {
+							pendingToolUseIdSet = getReplayablePendingToolUseIds(
+								resumeSessionId,
+								cwd,
+								pendingUuid,
+								pendingToolUseIdSet,
+							);
+						}
 						const canReplayStructuredToolResults =
 							Boolean(pendingUuid) &&
 							resumeSessionAt === pendingUuid &&
@@ -1523,6 +1690,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							// Fallback to textual replay summaries instead.
 							tailAllowedToolUseIds = new Set<string>();
 						}
+						if (resumeSessionId && tailAllowedToolUseIds && tailAllowedToolUseIds.size > 0) {
+							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd, resumeSessionAt);
+							if (existingToolResultIds.size > 0) {
+								tailAllowedToolUseIds = new Set(
+									[...tailAllowedToolUseIds].filter((id) => !existingToolResultIds.has(id)),
+								);
+							}
+						}
 						if (!tailPlan.tailHasAssistant) {
 							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
 						}
@@ -1531,8 +1706,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 							pendingToolUseTimestamp: null,
 							pendingToolUseIds: null,
 						});
-					} else if (!tailPlan.tailHasAssistant) {
-						prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
+					} else {
+						if (resumeSessionId && tailAllowedToolUseIds && tailAllowedToolUseIds.size > 0) {
+							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd, resumeSessionAt);
+							if (existingToolResultIds.size > 0) {
+								tailAllowedToolUseIds = new Set(
+									[...tailAllowedToolUseIds].filter((id) => !existingToolResultIds.has(id)),
+								);
+							}
+						}
+						if (!tailPlan.tailHasAssistant) {
+							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
+						}
 					}
 					resumeTailAllowedToolUseIds = tailAllowedToolUseIds;
 				}
@@ -1967,4 +2152,7 @@ export const __test = {
 	isErroredAssistantMessage,
 	sanitizeAssistantContentForEmit,
 	isIgnorableTransportWriteAfterCloseError,
+	normalizeClaudeProjectDirName,
+	collectRecordedToolResultIdsFromNodes,
+	collectUnresolvedToolUseIdsOnAnchorPath,
 };
