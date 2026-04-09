@@ -684,12 +684,33 @@ function mapToolArgs(
 				path: resolvePath(input.file_path ?? input.path),
 				content: input.content,
 			};
-		case "edit":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				oldText: input.old_string ?? input.oldText ?? input.old_text,
-				newText: input.new_string ?? input.newText ?? input.new_text,
-			};
+		case "edit": {
+			const path = resolvePath(input.file_path ?? input.path);
+			const mappedEdits = Array.isArray(input.edits)
+				? input.edits
+						.map((item) => {
+							if (!item || typeof item !== "object") return null;
+							const editItem = item as Record<string, unknown>;
+							const oldText = editItem.oldText ?? editItem.old_string ?? editItem.old_text;
+							const newText = editItem.newText ?? editItem.new_string ?? editItem.new_text;
+							if (typeof oldText !== "string" || typeof newText !== "string") return null;
+							return { oldText, newText };
+						})
+						.filter((item): item is { oldText: string; newText: string } => item !== null)
+				: [];
+
+			if (mappedEdits.length > 0) {
+				return { path, edits: mappedEdits };
+			}
+
+			const oldText = input.old_string ?? input.oldText ?? input.old_text;
+			const newText = input.new_string ?? input.newText ?? input.new_text;
+			if (typeof oldText === "string" && typeof newText === "string") {
+				return { path, edits: [{ oldText, newText }] };
+			}
+
+			return { path, edits: mappedEdits };
+		}
 		case "bash":
 			return {
 				command: input.command,
