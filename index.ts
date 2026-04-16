@@ -879,15 +879,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
-			const settingSources: SettingSource[] | undefined = appendSystemPrompt
-				? undefined
-				: providerSettings.settingSources ?? ["user", "project"];
+			const settingSources: SettingSource[] | undefined = providerSettings.settingSources
+				?? (appendSystemPrompt ? undefined : ["user", "project"]);
 
 			// Claude Code will auto-load MCP servers from ~/.claude.json and .mcp.json when settingSources is enabled.
 			// In this provider, Claude Code tool execution is denied and pi executes tools instead, so auto-loaded MCP
 			// tools are pure token overhead. Pass --strict-mcp-config to ignore all MCP configs except those explicitly
 			// provided via the SDK (mcpServers option).
-			const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
+			const strictMcpConfigEnabled = providerSettings.strictMcpConfig ?? !appendSystemPrompt;
 			const extraArgs = strictMcpConfigEnabled ? { "strict-mcp-config": null } : undefined;
 
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {

@@ -115,3 +115,16 @@ The provider automatically maps these back to the pi tool name (e.g. `subagent`)
    ln -s ~/.pi/agent/AGENTS.md ~/.claude/CLAUDE.md
    ln -s ~/.pi/agent/skills ~/.claude/skills
    ```
+
+3) **Append + full isolation**
+   - Pi skills in the prompt, but no settings/MCP inheritance from Claude Code.
+
+   ```json
+   {
+     "claudeAgentSdkProvider": {
+       "appendSystemPrompt": true,
+       "settingSources": [],
+       "strictMcpConfig": true
+     }
+   }
+   ```
