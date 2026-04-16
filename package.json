@@ -1,6 +1,6 @@
 {
   "name": "claude-agent-sdk-pi",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "keywords": [
     "pi-package"
   ],
@@ -11,12 +11,12 @@
     "change-case": "^5.4.4"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.52.0",
-    "@mariozechner/pi-coding-agent": "^0.52.0"
+    "@mariozechner/pi-ai": "^0.65.2",
+    "@mariozechner/pi-coding-agent": "^0.65.2"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.52.0",
-    "@mariozechner/pi-coding-agent": "^0.52.0",
+    "@mariozechner/pi-ai": "^0.65.2",
+    "@mariozechner/pi-coding-agent": "^0.65.2",
     "@types/node": "^24.3.0"
   },
   "pi": {
