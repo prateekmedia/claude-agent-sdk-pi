@@ -1,9 +1,10 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource, type ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
+import { createRequire } from "module";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
 
@@ -788,6 +789,66 @@ function mapThinkingTokens(
 	return DEFAULT_THINKING_BUDGETS[effectiveReasoning];
 }
 
+function supportsAdaptiveThinking(modelId: string): boolean {
+	return (
+		modelId.includes("opus-4-6") ||
+		modelId.includes("opus-4.6") ||
+		modelId.includes("opus-4-7") ||
+		modelId.includes("opus-4.7") ||
+		modelId.includes("sonnet-4-6") ||
+		modelId.includes("sonnet-4.6")
+	);
+}
+
+// Shifted up one level to preserve the effective budget users had with
+// maxThinkingTokens before this PR: minimal→low, low→medium, etc.
+// xhigh lands at the SDK's `max` cap.
+const PI_LEVEL_TO_EFFORT: Record<ThinkingLevel, EffortLevel> = {
+	minimal: "low",
+	low: "medium",
+	medium: "high",
+	high: "xhigh",
+	xhigh: "max",
+};
+
+/**
+ * Resolves the Claude Code native binary shipped as a platform-specific
+ * optional dependency of @anthropic-ai/claude-agent-sdk.
+ *
+ * We use createRequire bound to the SDK's own location so that nested
+ * installs (pnpm strict, etc.) are found even when npm doesn't hoist the
+ * optional dep.  The SDK's auto-resolution has known bugs (#296, #6867),
+ * so we bypass it and pass the path explicitly via
+ * options.pathToClaudeCodeExecutable.
+ */
+function resolveClaudeCodeExecutable(): string {
+	if (process.env.CLAUDE_CODE_EXECUTABLE) {
+		return process.env.CLAUDE_CODE_EXECUTABLE;
+	}
+	const ext = process.platform === "win32" ? ".exe" : "";
+	// Linux: try musl first (Alpine, Void, etc.), then glibc fallback.
+	// See claude-agent-sdk-typescript#296 for the SDK-side bug.
+	const candidates =
+		process.platform === "linux"
+			? [
+				`@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+				`@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+			]
+			: [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
+	const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
+	for (const candidate of candidates) {
+		try {
+			return req.resolve(candidate);
+		} catch {
+			// try next candidate
+		}
+	}
+	throw new Error(
+		`Claude native binary not found for ${process.platform}-${process.arch}. ` +
+		`Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
+	);
+}
+
 function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
 	if (!input) return fallback;
 	try {
@@ -900,14 +961,20 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					message: TOOL_EXECUTION_DENIED_MESSAGE,
 				}),
 				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
+				pathToClaudeCodeExecutable: resolveClaudeCodeExecutable(),
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
 				...(mcpServers ? { mcpServers } : {}),
 			};
 
-			const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
-			if (maxThinkingTokens != null) {
-				queryOptions.maxThinkingTokens = maxThinkingTokens;
+			if (options?.reasoning && supportsAdaptiveThinking(model.id)) {
+				queryOptions.thinking = { type: "adaptive", display: "summarized" } satisfies ThinkingConfig;
+				queryOptions.effort = PI_LEVEL_TO_EFFORT[options.reasoning];
+			} else {
+				const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
+				if (maxThinkingTokens != null) {
+					queryOptions.maxThinkingTokens = maxThinkingTokens;
+				}
 			}
 
 			sdkQuery = query({
