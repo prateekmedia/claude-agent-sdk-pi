@@ -1,22 +1,22 @@
 {
   "name": "claude-agent-sdk-pi",
-  "version": "1.0.20",
+  "version": "1.0.21",
   "keywords": [
     "pi-package"
   ],
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.2.117",
+    "@anthropic-ai/claude-agent-sdk": "0.2.126",
     "@anthropic-ai/sdk": "^0.73.0",
     "change-case": "^5.4.4"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.65.2",
-    "@mariozechner/pi-coding-agent": "^0.65.2"
+    "@mariozechner/pi-ai": "^0.72.1",
+    "@mariozechner/pi-coding-agent": "^0.72.1"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.65.2",
-    "@mariozechner/pi-coding-agent": "^0.65.2",
+    "@mariozechner/pi-ai": "^0.72.1",
+    "@mariozechner/pi-coding-agent": "^0.72.1",
     "@types/node": "^24.3.0"
   },
   "pi": {

@@ -292,6 +292,10 @@ const MODELS = getModels("anthropic").map((model) => ({
 	cost: model.cost,
 	contextWindow: model.contextWindow,
 	maxTokens: model.maxTokens,
+	thinkingLevelMap: {
+		...model.thinkingLevelMap,
+		minimal: null,
+	},
 }));
 
 
@@ -716,7 +720,7 @@ function buildCustomToolServers(customTools: Tool[]): Record<string, ReturnType<
 		// These tool stubs are always denied anyway (pi executes tools, not the SDK).
 		inputSchema: {},
 		handler: async () => ({
-			content: [{ type: "text", text: TOOL_EXECUTION_DENIED_MESSAGE }],
+			content: [{ type: "text" as const, text: TOOL_EXECUTION_DENIED_MESSAGE }],
 			isError: true,
 		}),
 	}));
@@ -800,16 +804,22 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 	);
 }
 
-// Shifted up one level to preserve the effective budget users had with
-// maxThinkingTokens before this PR: minimal→low, low→medium, etc.
-// xhigh lands at the SDK's `max` cap.
-const PI_LEVEL_TO_EFFORT: Record<ThinkingLevel, EffortLevel> = {
-	minimal: "low",
-	low: "medium",
-	medium: "high",
-	high: "xhigh",
-	xhigh: "max",
-};
+function mapThinkingLevelToEffort(model: Model<any>, level: ThinkingLevel): EffortLevel {
+	const mapped = model.thinkingLevelMap?.[level];
+	if (typeof mapped === "string") return mapped as EffortLevel;
+
+	switch (level) {
+		case "minimal":
+		case "low":
+			return "low";
+		case "medium":
+			return "medium";
+		case "high":
+			return "high";
+		case "xhigh":
+			return "xhigh";
+	}
+}
 
 /**
  * Resolves the Claude Code native binary shipped as a platform-specific
@@ -969,7 +979,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			if (options?.reasoning && supportsAdaptiveThinking(model.id)) {
 				queryOptions.thinking = { type: "adaptive", display: "summarized" } satisfies ThinkingConfig;
-				queryOptions.effort = PI_LEVEL_TO_EFFORT[options.reasoning];
+				queryOptions.effort = mapThinkingLevelToEffort(model, options.reasoning);
 			} else {
 				const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
 				if (maxThinkingTokens != null) {
