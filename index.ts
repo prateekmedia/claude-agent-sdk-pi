@@ -363,36 +363,40 @@ function buildPromptBlocks(
 
 	for (const message of context.messages) {
 		if (message.role === "user") {
-			pushPrefix("USER:");
+			pushPrefix('<message role="user">');
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
 				pushText("(see attached image)");
 			}
+			pushText("\n</message>");
 			continue;
 		}
 
 		if (message.role === "assistant") {
-			pushPrefix("ASSISTANT:");
+			pushPrefix('<message role="assistant">');
 			const text = contentToText(message.content, customToolNameToSdk);
 			if (text.length > 0) {
 				pushText(text);
 			}
+			pushText("\n</message>");
 			continue;
 		}
 
 		if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}, id=${message.toolCallId}):`;
-			pushPrefix(header);
+			const toolName = mapPiToolNameToSdk(message.toolName, customToolNameToSdk);
+			pushPrefix(`<tool_result tool_use_id="${message.toolCallId}" tool_name="${toolName}">`);
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
 				pushText("(see attached image)");
 			}
+			pushText("\n</tool_result>");
 		}
 	}
 
 	if (toolWatchNote && toolWatchNote.trim().length > 0) {
-		pushPrefix("RECOVERED TOOL RESULTS:");
+		pushPrefix("<recovered_tool_results>");
 		pushText(toolWatchNote.trim());
+		pushText("\n</recovered_tool_results>");
 	}
 
 	if (!blocks.length) return [{ type: "text", text: "" }];
@@ -425,6 +429,7 @@ function contentToText(
 			type: string;
 			text?: string;
 			thinking?: string;
+			id?: string;
 			name?: string;
 			arguments?: Record<string, unknown>;
 		}>,
@@ -435,11 +440,12 @@ function contentToText(
 	return content
 		.map((block) => {
 			if (block.type === "text") return block.text ?? "";
-			if (block.type === "thinking") return block.thinking ?? "";
+			if (block.type === "thinking") return `<thinking>\n${block.thinking ?? ""}\n</thinking>`;
 			if (block.type === "toolCall") {
 				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
 				const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-				return `Historical tool call (non-executable): ${toolName} args=${args}`;
+				const idAttr = block.id ? ` id="${block.id}"` : "";
+				return `<tool_use${idAttr} name="${toolName}">${args}</tool_use>`;
 			}
 			return `[${block.type}]`;
 		})
@@ -1256,3 +1262,8 @@ export default function (pi: ExtensionAPI) {
 		streamSimple: streamClaudeAgentSdk,
 	});
 }
+
+export const __test = {
+	buildPromptBlocks,
+	contentToText,
+};
