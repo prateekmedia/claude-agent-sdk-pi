@@ -476,6 +476,13 @@ type ProviderSettings = {
 	 * schemas (a major token cost) when appendSystemPrompt=false.
 	 */
 	strictMcpConfig?: boolean;
+
+	/**
+	 * Strip Claude Code's per-user dynamic sections (cwd, auto-memory, git status)
+	 * from the system prompt. Pair with `settingSources: []` to keep pi's prompt
+	 * free of Claude Code framing.
+	 */
+	excludeDynamicSections?: boolean;
 };
 
 function extractSkillsAppend(systemPrompt?: string): string | undefined {
@@ -524,11 +531,17 @@ function readSettingsFile(filePath: string): ProviderSettings {
 		const strictMcpConfig =
 			typeof settingsBlock["strictMcpConfig"] === "boolean" ? settingsBlock["strictMcpConfig"] : undefined;
 
+		const excludeDynamicSections =
+			typeof settingsBlock["excludeDynamicSections"] === "boolean"
+				? settingsBlock["excludeDynamicSections"]
+				: undefined;
+
 		const legacyDisable = false;
 		return {
 			appendSystemPrompt: appendSystemPrompt ?? (legacyDisable ? false : undefined),
 			settingSources,
 			strictMcpConfig,
+			excludeDynamicSections,
 		};
 	} catch {
 		return {};
@@ -970,7 +983,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					behavior: "deny",
 					message: TOOL_EXECUTION_DENIED_MESSAGE,
 				}),
-				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
+				systemPrompt: {
+					type: "preset",
+					preset: "claude_code",
+					append: systemPromptAppend ? systemPromptAppend : undefined,
+					...(providerSettings.excludeDynamicSections ? { excludeDynamicSections: true } : {}),
+				},
 				pathToClaudeCodeExecutable: resolveClaudeCodeExecutable(),
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
