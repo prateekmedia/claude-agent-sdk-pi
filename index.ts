@@ -756,6 +756,12 @@ const DEFAULT_THINKING_BUDGETS: Record<NonXhighThinkingLevel, number> = {
 	high: 31999,
 };
 
+// Claude Code's default output token maximum (covers thinking + text combined).
+// Must be raised when thinking budgets approach or exceed this ceiling.
+const CLAUDE_CODE_DEFAULT_MAX_OUTPUT_TOKENS = 32000;
+// Headroom for text output on top of the thinking budget.
+const TEXT_OUTPUT_HEADROOM_TOKENS = 16384;
+
 // NOTE: "xhigh" is unavailable in the TUI because pi-ai's supportsXhigh()
 // doesn't recognize the "claude-agent-sdk" api type. As a workaround, opus-4-6
 // gets shifted budgets so "high" uses the budget that xhigh would normally use.
@@ -980,10 +986,58 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			if (options?.reasoning && supportsAdaptiveThinking(model.id)) {
 				queryOptions.thinking = { type: "adaptive", display: "summarized" } satisfies ThinkingConfig;
 				queryOptions.effort = mapThinkingLevelToEffort(model, options.reasoning);
-			} else {
-				const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
+			} else if (options?.reasoning) {
+				let maxThinkingTokens = mapThinkingTokens(options.reasoning, model.id, options?.thinkingBudgets);
 				if (maxThinkingTokens != null) {
+					// Cap the thinking budget so it leaves room for text output within the
+					// model's actual API max output limit. Models like opus-4-0 and opus-4-1
+					// have a 32k API max — assigning 31,999 thinking tokens leaves no room.
+					const apiMaxTokens = model.maxTokens ?? Number.MAX_SAFE_INTEGER;
+					const cappedBudget = Math.min(maxThinkingTokens, apiMaxTokens - TEXT_OUTPUT_HEADROOM_TOKENS);
+					if (cappedBudget < maxThinkingTokens) {
+						maxThinkingTokens = cappedBudget;
+					}
 					queryOptions.maxThinkingTokens = maxThinkingTokens;
+				}
+			}
+
+			// When thinking is enabled, the combined thinking + text output can exceed
+			// Claude Code's default 32k output token ceiling. Raise the limit via env
+			// so the CLI doesn't error with "response exceeded the 32000 output token
+			// maximum". Only raise the value — never lower a user-supplied override.
+			//
+			// For adaptive thinking models, we don't know the actual token budget at
+			// request time — the model decides dynamically. Set the ceiling to the
+			// model's API max output so adaptive thinking has full headroom.
+			if (options?.reasoning) {
+				let requiredMax: number | undefined;
+
+				if (supportsAdaptiveThinking(model.id)) {
+					// Adaptive thinking: use the model's full API max output as the ceiling.
+					const apiMaxTokens = model.maxTokens ?? Number.MAX_SAFE_INTEGER;
+					if (apiMaxTokens > CLAUDE_CODE_DEFAULT_MAX_OUTPUT_TOKENS) {
+						requiredMax = apiMaxTokens;
+					}
+				} else {
+					// Manual thinking: derive from budget + text headroom.
+					const budget = mapThinkingTokens(options.reasoning, model.id, options?.thinkingBudgets);
+					if (budget != null) {
+						const candidate = budget + TEXT_OUTPUT_HEADROOM_TOKENS;
+						if (candidate > CLAUDE_CODE_DEFAULT_MAX_OUTPUT_TOKENS) {
+							requiredMax = candidate;
+						}
+					}
+				}
+
+				if (requiredMax != null) {
+					const existingRaw = process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+					const existing = existingRaw != null ? Number(existingRaw) : undefined;
+					if (!Number.isFinite(existing) || existing < requiredMax) {
+						queryOptions.env = {
+							...process.env,
+							CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(requiredMax),
+						};
+					}
 				}
 			}
 
