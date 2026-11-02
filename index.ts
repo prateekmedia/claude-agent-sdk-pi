@@ -2,11 +2,12 @@ import { calculateCost, createAssistantMessageEventStream, getModels, type Assis
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource, type ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, ToolSchema } from "@modelcontextprotocol/sdk/types.js";
 import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
 import { createRequire } from "module";
 import { homedir } from "os";
-import { dirname, join, relative, resolve } from "path";
+import { join } from "path";
 
 const PROVIDER_ID = "claude-agent-sdk";
 
@@ -36,13 +37,8 @@ const TOOL_EXECUTION_DENIED_MESSAGE = "Tool execution is unavailable in this env
 const MCP_SERVER_NAME = "custom-tools";
 const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
-const SKILLS_ALIAS_GLOBAL = "~/.claude/skills";
-const SKILLS_ALIAS_PROJECT = ".claude/skills";
-const GLOBAL_SKILLS_ROOT = join(homedir(), ".pi", "agent", "skills");
-const PROJECT_SKILLS_ROOT = join(process.cwd(), ".pi", "skills");
 const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
-const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
 const TOOL_WATCH_CUSTOM_TYPE = "claude-agent-sdk-tool-watch";
 const MAX_TRACKED_TOOL_EXECUTIONS = 256;
@@ -478,18 +474,6 @@ type ProviderSettings = {
 	strictMcpConfig?: boolean;
 };
 
-function extractSkillsAppend(systemPrompt?: string): string | undefined {
-	if (!systemPrompt) return undefined;
-	const startMarker = "The following skills provide specialized instructions for specific tasks.";
-	const endMarker = "</available_skills>";
-	const startIndex = systemPrompt.indexOf(startMarker);
-	if (startIndex === -1) return undefined;
-	const endIndex = systemPrompt.indexOf(endMarker, startIndex);
-	if (endIndex === -1) return undefined;
-	const skillsBlock = systemPrompt.slice(startIndex, endIndex + endMarker.length).trim();
-	return rewriteSkillsLocations(skillsBlock);
-}
-
 function loadProviderSettings(): ProviderSettings {
 	const globalSettings = readSettingsFile(GLOBAL_SETTINGS_PATH);
 	const projectSettings = readSettingsFile(PROJECT_SETTINGS_PATH);
@@ -535,79 +519,6 @@ function readSettingsFile(filePath: string): ProviderSettings {
 	}
 }
 
-function rewriteSkillsLocations(skillsBlock: string): string {
-	return skillsBlock.replace(/<location>([^<]+)<\/location>/g, (_match, location: string) => {
-		let rewritten = location;
-		if (location.startsWith(GLOBAL_SKILLS_ROOT)) {
-			const relPath = relative(GLOBAL_SKILLS_ROOT, location).replace(/^\.+/, "");
-			rewritten = `${SKILLS_ALIAS_GLOBAL}/${relPath}`.replace(/\/\/+/g, "/");
-		} else if (location.startsWith(PROJECT_SKILLS_ROOT)) {
-			const relPath = relative(PROJECT_SKILLS_ROOT, location).replace(/^\.+/, "");
-			rewritten = `${SKILLS_ALIAS_PROJECT}/${relPath}`.replace(/\/\/+/g, "/");
-		}
-		return `<location>${rewritten}</location>`;
-	});
-}
-
-function resolveAgentsMdPath(): string | undefined {
-	const fromCwd = findAgentsMdInParents(process.cwd());
-	if (fromCwd) return fromCwd;
-	if (existsSync(GLOBAL_AGENTS_PATH)) return GLOBAL_AGENTS_PATH;
-	return undefined;
-}
-
-function findAgentsMdInParents(startDir: string): string | undefined {
-	let current = resolve(startDir);
-	while (true) {
-		const candidate = join(current, "AGENTS.md");
-		if (existsSync(candidate)) return candidate;
-		const parent = dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return undefined;
-}
-
-function extractAgentsAppend(): string | undefined {
-	const agentsPath = resolveAgentsMdPath();
-	if (!agentsPath) return undefined;
-	try {
-		const content = readFileSync(agentsPath, "utf-8").trim();
-		if (!content) return undefined;
-		const sanitized = sanitizeAgentsContent(content);
-		return sanitized.length > 0 ? `# CLAUDE.md\n\n${sanitized}` : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function sanitizeAgentsContent(content: string): string {
-	let sanitized = content;
-	sanitized = sanitized.replace(/~\/\.pi\b/gi, "~/.claude");
-	sanitized = sanitized.replace(/(^|[\s'"`])\.pi\//g, "$1.claude/");
-	sanitized = sanitized.replace(/\b\.pi\b/gi, ".claude");
-	sanitized = sanitized.replace(/\bpi\b/gi, "environment");
-	return sanitized;
-}
-
-function rewriteSkillAliasPath(pathValue: unknown): unknown {
-	if (typeof pathValue !== "string") return pathValue;
-	if (pathValue.startsWith(SKILLS_ALIAS_GLOBAL)) {
-		return pathValue.replace(SKILLS_ALIAS_GLOBAL, "~/.pi/agent/skills");
-	}
-	if (pathValue.startsWith(`./${SKILLS_ALIAS_PROJECT}`)) {
-		return pathValue.replace(`./${SKILLS_ALIAS_PROJECT}`, PROJECT_SKILLS_ROOT);
-	}
-	if (pathValue.startsWith(SKILLS_ALIAS_PROJECT)) {
-		return pathValue.replace(SKILLS_ALIAS_PROJECT, PROJECT_SKILLS_ROOT);
-	}
-	const projectAliasAbs = join(process.cwd(), SKILLS_ALIAS_PROJECT);
-	if (pathValue.startsWith(projectAliasAbs)) {
-		return pathValue.replace(projectAliasAbs, PROJECT_SKILLS_ROOT);
-	}
-	return pathValue;
-}
-
 function mapToolName(name: string, customToolNameToPi?: Map<string, string>): string {
 	const normalized = name.toLowerCase();
 	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
@@ -625,27 +536,25 @@ function mapToolName(name: string, customToolNameToPi?: Map<string, string>): st
 function mapToolArgs(
 	toolName: string,
 	args: Record<string, unknown> | undefined,
-	allowSkillAliasRewrite = true,
 ): Record<string, unknown> {
 	const normalized = toolName.toLowerCase();
 	const input = args ?? {};
-	const resolvePath = (value: unknown) => (allowSkillAliasRewrite ? rewriteSkillAliasPath(value) : value);
 
 	switch (normalized) {
 		case "read":
 			return {
-				path: resolvePath(input.file_path ?? input.path),
+				path: input.file_path ?? input.path,
 				offset: input.offset,
 				limit: input.limit,
 			};
 		case "write":
 			return {
-				path: resolvePath(input.file_path ?? input.path),
+				path: input.file_path ?? input.path,
 				content: input.content,
 			};
 		case "edit":
 			return {
-				path: resolvePath(input.file_path ?? input.path),
+				path: input.file_path ?? input.path,
 				oldText: input.old_string ?? input.oldText ?? input.old_text,
 				newText: input.new_string ?? input.newText ?? input.new_text,
 			};
@@ -657,14 +566,14 @@ function mapToolArgs(
 		case "grep":
 			return {
 				pattern: input.pattern,
-				path: resolvePath(input.path),
+				path: input.path,
 				glob: input.glob,
 				limit: input.head_limit ?? input.limit,
 			};
 		case "find":
 			return {
 				pattern: input.pattern,
-				path: resolvePath(input.path),
+				path: input.path,
 			};
 		default:
 			return input;
@@ -712,23 +621,25 @@ function resolveSdkTools(context: Context): {
 function buildCustomToolServers(customTools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!customTools.length) return undefined;
 
-	const mcpTools = customTools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		// Pass empty raw shape instead of JSON Schema — the SDK (>=0.2.107)
-		// validates inputSchema as Zod or raw shape and rejects plain JSON Schema.
-		// These tool stubs are always denied anyway (pi executes tools, not the SDK).
-		inputSchema: {},
-		handler: async () => ({
+	const mcpTools = customTools.map((tool) => {
+		try {
+			return ToolSchema.parse({ name: tool.name, description: tool.description, inputSchema: tool.parameters });
+		} catch (error) {
+			throw new Error(`Invalid MCP contract for Pi tool "${tool.name}": ${error instanceof Error ? error.message : String(error)}`);
+		}
+	});
+	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0" });
+	// The public low-level MCP API preserves JSON Schema without a lossy Zod round trip.
+	server.instance.server.registerCapabilities({ tools: {} });
+	server.instance.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: mcpTools }));
+	server.instance.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+		if (!mcpTools.some((tool) => tool.name === request.params.name)) {
+			throw new McpError(ErrorCode.InvalidParams, `Tool ${request.params.name} not found`);
+		}
+		return {
 			content: [{ type: "text" as const, text: TOOL_EXECUTION_DENIED_MESSAGE }],
 			isError: true,
-		}),
-	}));
-
-	const server = createSdkMcpServer({
-		name: MCP_SERVER_NAME,
-		version: "1.0.0",
-		tools: mcpTools,
+		};
 	});
 
 	return { [MCP_SERVER_NAME]: server };
@@ -944,11 +855,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const mcpServers = buildCustomToolServers(customTools);
 			const providerSettings = loadProviderSettings();
 			const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
-			const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-			const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
-			const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
-			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
 			const settingSources: SettingSource[] | undefined = providerSettings.settingSources
 				?? (appendSystemPrompt ? undefined : ["user", "project"]);
@@ -970,7 +876,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					behavior: "deny",
 					message: TOOL_EXECUTION_DENIED_MESSAGE,
 				}),
-				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
+				systemPrompt: appendSystemPrompt
+					? { type: "preset", preset: "claude_code", append: context.systemPrompt }
+					: context.systemPrompt ?? "",
 				pathToClaudeCodeExecutable: resolveClaudeCodeExecutable(),
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
@@ -1116,7 +1024,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								block.arguments = mapToolArgs(
 									block.name,
 									parsePartialJson(block.partialJson, block.arguments),
-									allowSkillAliasRewrite,
 								);
 								delete (block as any).partialJson;
 								stream.push({

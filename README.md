@@ -8,7 +8,7 @@ This extension registers a custom provider that routes LLM calls through the **C
 - Tool execution is **blocked in Claude Code**; pi executes tools natively.
 - Built-in tool calls are mapped to Claude Code tool names.
 - Custom tools are exposed to Claude Code via in-process MCP.
-- Skills can be appended to Claude Code’s default system prompt (optional).
+- Pi’s complete effective system prompt reaches the SDK unchanged, including parent context, role instructions, project instructions, and skills.
 
 ## Demo
 
@@ -88,43 +88,29 @@ The provider automatically maps these back to the pi tool name (e.g. `subagent`)
 
 ## Context loading
 
-1) **Append to system prompt (Default)**
-   - Uses **AGENTS.md + skills** from pi and appends to Claude Code’s preset prompt.
-   - No extra config needed.
+The provider always transmits Pi’s effective `context.systemPrompt` verbatim. Pi owns instruction assembly. The provider does not reread `AGENTS.md`, extract selected skills, rename tools in instructions, or rewrite instruction text or paths. Built-in tool-name and argument-key mapping described above remains unchanged; tool paths are no longer rewritten to compensate for rewritten skill instructions.
 
-2) **Use Claude Code’s dir (Recommended)**
-   - Set `appendSystemPrompt: false` so Claude Code loads its own resources from `.claude/`.
-   - By default it loads both user + project settings (`["user","project"]`).
-   - If you want to **ignore project-level `.claude/` folders**, set `settingSources: ["user"]`.
-   - This provider runs Claude Code in a **tool-denied** mode (pi executes tools), so auto-loading MCP servers from
-     `~/.claude.json` is usually just token overhead. By default, the provider passes `--strict-mcp-config` to prevent
-     that tool schema dump. Set `strictMcpConfig: false` to opt out.
+- **Default (`appendSystemPrompt: true`):** append the complete Pi prompt once to the SDK’s `claude_code` preset.
+- **Changed behavior (`appendSystemPrompt: false`):** use the complete Pi prompt as the SDK’s replacement system prompt, without the Claude Code preset. This setting no longer suppresses Pi instructions. Existing users who relied on Claude-only instructions must migrate; there is no silent instruction opt-out.
+- `settingSources` still selects Claude Code filesystem settings. With `appendSystemPrompt: false`, its default remains `["user", "project"]`. Explicitly selected Claude resources are additional to Pi’s prompt; avoid linking the same instructions into both systems.
+- `strictMcpConfig` still defaults to `false` in append mode and `true` in replacement mode. Enable it to prevent unrelated MCP servers from being auto-loaded. SDK-side execution remains denied in either mode.
 
-   **Config (user-only CLAUDE.md/skills + no MCP auto-load):**
-   ```json
-   {
-     "claudeAgentSdkProvider": {
-       "appendSystemPrompt": false,
-       "settingSources": ["user"],
-       "strictMcpConfig": true
-     }
-   }
-   ```
+For the Claude Code preset plus Pi’s complete prompt, without inherited settings or MCP servers:
 
-   ```bash
-   ln -s ~/.pi/agent/AGENTS.md ~/.claude/CLAUDE.md
-   ln -s ~/.pi/agent/skills ~/.claude/skills
-   ```
+```json
+{
+  "claudeAgentSdkProvider": {
+    "appendSystemPrompt": true,
+    "settingSources": [],
+    "strictMcpConfig": true
+  }
+}
+```
 
-3) **Append + full isolation**
-   - Pi skills in the prompt, but no settings/MCP inheritance from Claude Code.
+### Custom-tool schema compatibility
 
-   ```json
-   {
-     "claudeAgentSdkProvider": {
-       "appendSystemPrompt": true,
-       "settingSources": [],
-       "strictMcpConfig": true
-     }
-   }
-   ```
+Pi supplies JSON Schema, while the Agent SDK’s high-level `tools[].inputSchema` interface expects a Zod raw shape. The provider uses the public low-level MCP request handlers on the SDK-created server instead: `tools/list` advertises Pi’s original JSON Schema without conversion, and `tools/call` returns the existing execution-denied error. This preserves required fields, nested objects, arrays, enums, references, records, and validation constraints without a lossy Zod round trip. Invalid MCP tool envelopes fail with the offending Pi tool’s name rather than falling back to an empty schema. Pi remains responsible for validating and executing actual calls.
+
+### Compatibility checks
+
+Development dependencies retain upstream’s Pi 0.74.x baseline; peer ranges also allow Pi 1.4 and later compatible 1.x releases. Pi 1.x’s extension loader supplies the legacy API compatibility view used by this extension. Run `npm ci --ignore-scripts` and `npm test` on Node 24. To repeat the same seam checks with another installed Pi version, set `PI_TEST_AGENT_ENTRY` to the file URL of that installation’s `dist/index.js`. The tests load the extension through Pi’s actual loader and run the official SDK against a disposable, credential-free transport fixture. They check effective instruction transmission, actual MCP discovery, Pi-side tool argument/result delivery, SDK execution denial, streaming, adaptive thinking, invalid contracts, and cancellation. They do not contact Claude or prove live subscription access.
