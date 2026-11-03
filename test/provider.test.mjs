@@ -18,6 +18,8 @@ writeFileSync(join(project, 'AGENTS.md'), 'NEARER_FILE_MUST_NOT_REPLACE_EFFECTIV
 const entry = process.env.PI_TEST_AGENT_ENTRY ?? import.meta.resolve('@earendil-works/pi-coding-agent');
 const { loadExtensions, loadExtensionFromFactory } = await import(new URL('./core/extensions/loader.js', entry));
 const { wrapRegisteredTool } = await import(entry);
+// Pi 1.x normalizes every provider context to a { messages } transcript; Pi 0.74 passes it unchanged.
+const { normalizeContext = (context) => context } = await import(new URL('../../pi-ai/dist/index.js', entry));
 const extensionPath = resolve(originalCwd, process.env.PI_TEST_EXTENSION ?? 'index.ts');
 const loaded = await loadExtensions([extensionPath], project);
 assert.deepEqual(loaded.errors, []);
@@ -52,7 +54,7 @@ async function run({ settings = {}, signal, scenario = 'normal', messages = [{ r
   const capture = join(root, `capture-${++sequence}.jsonl`);
   process.env.SDK_TEST_CAPTURE = capture;
   process.env.SDK_TEST_SCENARIO = scenario;
-  const stream = provider.streamSimple(model, { systemPrompt, tools, messages }, { reasoning: 'high', signal });
+  const stream = provider.streamSimple(model, normalizeContext({ systemPrompt, tools, messages }), { reasoning: 'high', signal });
   const events = [];
   for await (const event of stream) events.push(event);
   const records = readFileSync(capture, 'utf8').trim().split('\n').map(JSON.parse);
@@ -111,7 +113,7 @@ test('streamed arguments reach Pi unchanged; SDK execution is denied; thinking a
 });
 
 test('invalid MCP parameter contracts name the offending Pi tool instead of becoming permissive', async () => {
-  const stream = provider.streamSimple(model, { systemPrompt, tools: [{ name: 'bad_contract', description: 'Invalid contract', parameters: { type: 'array' } }], messages: [] }, {});
+  const stream = provider.streamSimple(model, normalizeContext({ systemPrompt, tools: [{ name: 'bad_contract', description: 'Invalid contract', parameters: { type: 'array' } }], messages: [] }), {});
   const events = [];
   for await (const event of stream) events.push(event);
   assert.equal(events.at(-1).type, 'error');
