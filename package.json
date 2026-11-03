@@ -5,14 +5,18 @@
     "pi-package"
   ],
   "type": "module",
+  "scripts": {
+    "test": "node --test --test-timeout=10000 test/*.test.mjs"
+  },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.126",
     "@anthropic-ai/sdk": "^0.73.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "change-case": "^5.4.4"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.74.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0"
+    "@earendil-works/pi-ai": "^0.74.0 || ^1.4.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^1.4.0"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.74.0",
